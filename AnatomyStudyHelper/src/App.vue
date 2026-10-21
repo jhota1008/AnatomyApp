@@ -16,21 +16,43 @@ type Structure = {
 
 type Diagram = {
   id: string
+  ownerId: string
   title: string
   image: string
   imagePath: string
+  folderId: string | null
+  folderName: string
+  tags: string[]
+  visibility: 'private' | 'public'
   structures: Structure[]
   updatedAt: number
 }
 
-type LocalDiagram = Omit<Diagram, 'imagePath'> & { imagePath?: string }
+type Folder = { id: string; name: string }
+
+type LocalDiagram = Omit<Diagram, 'imagePath' | 'ownerId' | 'folderId' | 'folderName' | 'tags' | 'visibility'> & {
+  imagePath?: string
+  folderName?: string
+  tags?: string[]
+  visibility?: 'private' | 'public'
+}
 
 const storageKey = 'anatomy-study-diagrams'
 const databaseName = 'fieldnotes-anatomy'
 const storageBucket = 'anatomy-diagrams'
 const diagrams = ref<Diagram[]>([])
+const folders = ref<Folder[]>([])
 const legacyDiagrams = ref<LocalDiagram[]>([])
 const selectedId = ref('')
+const libraryView = ref<'mine' | 'public'>('mine')
+const folderFilter = ref('')
+const newFolderOpen = ref(false)
+const newFolderName = ref('')
+const newFolderNameInput = ref<HTMLInputElement | null>(null)
+const folderBusy = ref(false)
+const tagFilter = ref('')
+const tagDraft = ref('')
+const shareMessage = ref('')
 const mode = ref<'edit' | 'study'>('edit')
 const placing = ref(false)
 const pendingPoint = ref<{
@@ -68,6 +90,16 @@ let authSubscription: { unsubscribe: () => void } | undefined
 const pendingDiagramIds = new Set<string>()
 
 const activeDiagram = computed(() => diagrams.value.find((diagram) => diagram.id === selectedId.value))
+const canEditActive = computed(() => Boolean(activeDiagram.value && user.value && activeDiagram.value.ownerId === user.value.id))
+const libraryDiagrams = computed(() => diagrams.value.filter((diagram) =>
+    libraryView.value === 'mine' ? diagram.ownerId === user.value?.id : diagram.visibility === 'public',
+  ))
+const visibleDiagrams = computed(() => libraryDiagrams.value.filter((diagram) =>
+  (!folderFilter.value || diagram.folderId === folderFilter.value)
+  && (!tagFilter.value || diagram.tags.includes(tagFilter.value)),
+))
+const availableFolders = computed(() => [...folders.value].sort((first, second) => first.name.localeCompare(second.name)))
+const availableTags = computed(() => [...new Set(libraryDiagrams.value.flatMap((diagram) => diagram.tags))].sort())
 const correctCount = computed(() => {
   if (!activeDiagram.value) return 0
   return activeDiagram.value.structures.filter((structure) => isCorrect(structure)).length
@@ -106,6 +138,7 @@ onMounted(async () => {
       if (session?.user) void loadCloudDiagrams()
       else {
         diagrams.value = []
+        folders.value = []
         selectedId.value = ''
         legacyDiagrams.value = []
         cloudReady.value = false
@@ -178,10 +211,18 @@ async function loadCloudDiagrams() {
   cloudReady.value = false
   appError.value = ''
   try {
+    const { data: folderRows, error: folderError } = await supabase
+      .from('folders')
+      .select('id, name')
+      .eq('user_id', user.value.id)
+      .order('name')
+    if (folderError) throw folderError
+    folders.value = folderRows ?? []
+
     const { data, error } = await supabase
       .from('diagrams')
-      .select('id, title, image_path, updated_at, structures(id, name, x, y, label_x, label_y, target_type, radius, position)')
-      .eq('user_id', user.value.id)
+      .select('id, user_id, title, image_path, folder_id, updated_at, tags, visibility, structures(id, name, x, y, label_x, label_y, target_type, radius, position)')
+      .or(`user_id.eq.${user.value.id},visibility.eq.public`)
       .order('updated_at', { ascending: false })
     if (error) throw error
 
@@ -193,9 +234,14 @@ async function loadCloudDiagrams() {
       if (imageError) throw imageError
       loaded.push({
         id: row.id,
+        ownerId: row.user_id,
         title: row.title,
         image: signedImage.signedUrl,
         imagePath: row.image_path,
+        folderId: row.folder_id,
+        folderName: folders.value.find((folder) => folder.id === row.folder_id)?.name ?? '',
+        tags: row.tags ?? [],
+        visibility: row.visibility ?? 'private',
         updatedAt: new Date(row.updated_at).getTime(),
         structures: [...(row.structures ?? [])]
           .sort((first, second) => first.position - second.position)
@@ -212,7 +258,10 @@ async function loadCloudDiagrams() {
       })
     }
     diagrams.value = loaded
-    selectedId.value = loaded[0]?.id ?? ''
+    const requestedDiagramId = new URLSearchParams(window.location.search).get('diagram')
+    const requestedDiagram = loaded.find((diagram) => diagram.id === requestedDiagramId)
+    selectedId.value = requestedDiagram?.id ?? loaded[0]?.id ?? ''
+    libraryView.value = requestedDiagram?.ownerId !== user.value.id && requestedDiagram?.visibility === 'public' ? 'public' : 'mine'
     legacyDiagrams.value = await readLocalDiagrams()
   } catch (error) {
     appError.value = getErrorMessage(error)
@@ -326,6 +375,9 @@ async function handleFile(event: Event) {
       user_id: user.value.id,
       title,
       image_path: imagePath,
+      folder_id: null,
+      tags: [],
+      visibility: 'private',
     })
     if (error) {
       await supabase.storage.from(storageBucket).remove([imagePath])
@@ -337,13 +389,19 @@ async function handleFile(event: Event) {
     if (signedError) throw signedError
     diagrams.value.unshift({
       id: diagramId,
+      ownerId: user.value.id,
       title,
       image: signedImage.signedUrl,
       imagePath,
+      folderId: null,
+      folderName: '',
+      tags: [],
+      visibility: 'private',
       structures: [],
       updatedAt: Date.now(),
     })
     selectedId.value = diagramId
+    libraryView.value = 'mine'
     mode.value = 'edit'
     resetStudy()
     saveState.value = 'saved'
@@ -355,12 +413,18 @@ async function handleFile(event: Event) {
 }
 
 async function persistDiagram(diagram: Diagram) {
-  if (!supabase || !user.value || !cloudReady.value) return
+  if (!supabase || !user.value || diagram.ownerId !== user.value.id || !cloudReady.value) return
   try {
     const updatedAt = new Date().toISOString()
     const { error: diagramError } = await supabase
       .from('diagrams')
-      .update({ title: diagram.title, updated_at: updatedAt })
+      .update({
+        title: diagram.title,
+        folder_id: diagram.folderId,
+        tags: diagram.tags,
+        visibility: diagram.visibility,
+        updated_at: updatedAt,
+      })
       .eq('id', diagram.id)
       .eq('user_id', user.value.id)
     if (diagramError) throw diagramError
@@ -389,13 +453,100 @@ async function persistDiagram(diagram: Diagram) {
 }
 
 function setTitle(value: string) {
-  if (activeDiagram.value) {
+  if (activeDiagram.value && canEditActive.value) {
     activeDiagram.value.title = value
     activeDiagram.value.updatedAt = Date.now()
   }
 }
 
+function setDiagramFolder(folderId: string) {
+  if (!activeDiagram.value || !canEditActive.value) return
+  activeDiagram.value.folderId = folderId || null
+  activeDiagram.value.folderName = folders.value.find((folder) => folder.id === folderId)?.name ?? ''
+}
+
+async function createFolderRecord(name: string) {
+  if (!supabase || !user.value) throw new Error('Sign in to create a folder.')
+  const { data, error } = await supabase
+    .from('folders')
+    .insert({ user_id: user.value.id, name })
+    .select('id, name')
+    .single()
+  if (error) throw error
+  folders.value.push(data)
+  return data as Folder
+}
+
+async function createFolder() {
+  const name = newFolderName.value.trim()
+  if (!name || !supabase || !user.value) return
+  folderBusy.value = true
+  appError.value = ''
+  try {
+    await createFolderRecord(name)
+    newFolderName.value = ''
+    newFolderOpen.value = false
+    folderFilter.value = ''
+  } catch (error) {
+    appError.value = getErrorMessage(error)
+  } finally {
+    folderBusy.value = false
+  }
+}
+
+async function openNewFolder() {
+  newFolderName.value = ''
+  newFolderOpen.value = true
+  await nextTick()
+  newFolderNameInput.value?.focus()
+}
+
+async function getOrCreateFolderId(name: string) {
+  const normalizedName = name.trim()
+  if (!normalizedName) return null
+  const existing = folders.value.find((folder) => folder.name.toLocaleLowerCase() === normalizedName.toLocaleLowerCase())
+  if (existing) return existing.id
+  return (await createFolderRecord(normalizedName)).id
+}
+
+function addTag() {
+  if (!activeDiagram.value || !canEditActive.value) return
+  const tag = tagDraft.value.trim().replace(/^#/, '')
+  if (tag && !activeDiagram.value.tags.some((item) => item.toLocaleLowerCase() === tag.toLocaleLowerCase())) {
+    activeDiagram.value.tags.push(tag)
+  }
+  tagDraft.value = ''
+}
+
+function removeTag(tag: string) {
+  if (!activeDiagram.value || !canEditActive.value) return
+  activeDiagram.value.tags = activeDiagram.value.tags.filter((item) => item !== tag)
+}
+
+async function copyShareLink() {
+  if (!activeDiagram.value) return
+  const url = new URL(window.location.href)
+  url.searchParams.set('diagram', activeDiagram.value.id)
+  try {
+    await navigator.clipboard.writeText(url.toString())
+    shareMessage.value = 'Share link copied'
+  } catch {
+    shareMessage.value = url.toString()
+  }
+  window.setTimeout(() => { shareMessage.value = '' }, 3500)
+}
+
+function openDiagram(diagram: Diagram) {
+  selectedId.value = diagram.id
+  mode.value = 'edit'
+  resetStudy()
+  const url = new URL(window.location.href)
+  url.searchParams.set('diagram', diagram.id)
+  window.history.replaceState({}, '', url)
+}
+
 function setStructureName(structure: Structure, value: string) {
+  if (!canEditActive.value) return
   structure.name = value
   if (activeDiagram.value) activeDiagram.value.updatedAt = Date.now()
 }
@@ -437,7 +588,7 @@ function getStageCoordinates(clientX: number, clientY: number) {
 }
 
 function startCircle(event: PointerEvent) {
-  if (!placing.value || labelTargetType.value !== 'circle' || event.button !== 0) return
+  if (!placing.value || !canEditActive.value || labelTargetType.value !== 'circle' || event.button !== 0) return
   event.preventDefault()
   const center = getStageCoordinates(event.clientX, event.clientY)
   circleStart.value = center
@@ -485,7 +636,7 @@ function getLabelPosition(structure: Pick<Structure, 'x' | 'y' | 'labelX' | 'lab
 }
 
 function startLabelDrag(event: PointerEvent, structure: Structure) {
-  if (event.button !== 0 || placing.value) return
+  if (event.button !== 0 || placing.value || !canEditActive.value) return
   event.preventDefault()
   draggingLabelId.value = structure.id
   ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
@@ -579,11 +730,15 @@ async function importLocalDiagrams() {
       const extension = imageBlob.type.split('/')[1] || 'png'
       const imageFile = new File([imageBlob], `${localDiagram.title || 'diagram'}.${extension}`, { type: imageBlob.type || 'image/png' })
       const imagePath = await uploadImage(imageFile, localDiagram.id)
+      const folderId = await getOrCreateFolderId(localDiagram.folderName ?? '')
       const { error: diagramError } = await supabase.from('diagrams').insert({
         id: localDiagram.id,
         user_id: user.value.id,
         title: localDiagram.title,
         image_path: imagePath,
+        folder_id: folderId,
+        tags: localDiagram.tags ?? [],
+        visibility: localDiagram.visibility ?? 'private',
       })
       if (diagramError) {
         await supabase.storage.from(storageBucket).remove([imagePath])
@@ -709,25 +864,44 @@ function onDrop(event: DragEvent) {
       </button>
 
       <div class="library-heading">
-        <span>Your library</span><span class="count">{{ diagrams.length }}</span>
+        <span>{{ libraryView === 'mine' ? 'Your library' : 'Public library' }}</span><span class="count">{{ visibleDiagrams.length }}</span>
       </div>
+      <div class="library-tabs" role="tablist" aria-label="Diagram library">
+        <button type="button" role="tab" :aria-selected="libraryView === 'mine'" :class="{ active: libraryView === 'mine' }" @click="libraryView = 'mine'; folderFilter = ''; tagFilter = ''">My diagrams</button>
+        <button type="button" role="tab" :aria-selected="libraryView === 'public'" :class="{ active: libraryView === 'public' }" @click="libraryView = 'public'; folderFilter = ''; tagFilter = ''">Public</button>
+      </div>
+      <button v-if="libraryView === 'mine'" class="new-folder-button" type="button" @click="openNewFolder"><span>＋</span> New Folder</button>
+      <label v-if="libraryView === 'mine' && availableFolders.length" class="folder-filter-label">
+        <span>FOLDER</span>
+        <select v-model="folderFilter" aria-label="Filter by folder">
+          <option value="">All folders</option>
+          <option v-for="folder in availableFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option>
+        </select>
+      </label>
+      <label v-if="availableTags.length" class="folder-filter-label">
+        <span>TOPIC</span>
+        <select v-model="tagFilter" aria-label="Filter by tag">
+          <option value="">All topics</option>
+          <option v-for="tag in availableTags" :key="tag" :value="tag">{{ tag }}</option>
+        </select>
+      </label>
       <nav class="diagram-list" aria-label="Saved diagrams">
         <button
-          v-for="diagram in diagrams"
+          v-for="diagram in visibleDiagrams"
           :key="diagram.id"
           class="diagram-link"
           :class="{ active: selectedId === diagram.id }"
           type="button"
-          @click="selectedId = diagram.id; mode = 'edit'; resetStudy()"
+          @click="openDiagram(diagram)"
         >
           <span class="thumbnail"><img :src="diagram.image" :alt="''" /></span>
           <span class="diagram-link-copy">
             <span class="diagram-link-title">{{ diagram.title }}</span>
-            <span class="diagram-link-meta">{{ diagram.structures.length }} labels · {{ formatDate(diagram.updatedAt) }}</span>
+            <span class="diagram-link-meta">{{ diagram.structures.length }} labels · {{ libraryView === 'mine' ? diagram.folderName || 'Unfiled' : 'Shared publicly' }}</span>
           </span>
           <span class="active-dot"></span>
         </button>
-        <div v-if="!diagrams.length" class="library-empty">Your saved diagrams will live here.</div>
+        <div v-if="!visibleDiagrams.length" class="library-empty">{{ libraryView === 'mine' ? 'Your saved diagrams will appear here.' : 'No public diagrams yet.' }}</div>
       </nav>
 
       <div class="sidebar-bottom">
@@ -745,6 +919,14 @@ function onDrop(event: DragEvent) {
         </div>
       </header>
 
+      <div class="mobile-library-tabs" role="tablist" aria-label="Diagram library">
+        <button type="button" role="tab" :aria-selected="libraryView === 'mine'" :class="{ active: libraryView === 'mine' }" @click="libraryView = 'mine'; folderFilter = ''; tagFilter = ''">My diagrams</button>
+        <button type="button" role="tab" :aria-selected="libraryView === 'public'" :class="{ active: libraryView === 'public' }" @click="libraryView = 'public'; folderFilter = ''; tagFilter = ''">Public library</button>
+        <button v-if="libraryView === 'mine'" class="new-folder-button mobile-new-folder" type="button" @click="openNewFolder"><span>＋</span> New Folder</button>
+        <label v-if="libraryView === 'mine' && availableFolders.length" class="mobile-filter"><span>Folder</span><select v-model="folderFilter"><option value="">All folders</option><option v-for="folder in availableFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
+        <label v-if="availableTags.length" class="mobile-filter"><span>Topic</span><select v-model="tagFilter"><option value="">All topics</option><option v-for="tag in availableTags" :key="tag" :value="tag">{{ tag }}</option></select></label>
+      </div>
+
       <div v-if="appError" class="app-alert" role="alert"><span>{{ appError }}</span><button type="button" aria-label="Dismiss error" @click="appError = ''">×</button></div>
       <div v-if="legacyDiagrams.length" class="import-banner">
         <div><strong>{{ legacyDiagrams.length }} locally saved {{ legacyDiagrams.length === 1 ? 'diagram' : 'diagrams' }} found</strong><small>Import them into your account? The local copies stay until each upload succeeds.</small></div>
@@ -757,22 +939,25 @@ function onDrop(event: DragEvent) {
           <div>
             <div class="eyebrow"><span class="eyebrow-line"></span> YOUR STUDY MATERIAL</div>
             <input
-              v-if="mode === 'edit'"
+              v-if="mode === 'edit' && canEditActive"
               class="title-input"
               :value="activeDiagram.title"
               aria-label="Diagram title"
               @input="setTitle(($event.target as HTMLInputElement).value)"
             />
-            <h1 v-else class="page-title">{{ activeDiagram.title }}<span class="study-label">Practice</span></h1>
+            <h1 v-else class="page-title">{{ activeDiagram.title }}<span v-if="mode === 'study'" class="study-label">Practice</span></h1>
             <p class="subtitle">{{ mode === 'study' ? 'Name each label from memory.' : 'Build a visual study sheet, one label at a time.' }}</p>
           </div>
           <div class="heading-actions">
-            <template v-if="mode === 'edit'">
+            <template v-if="mode === 'edit' && canEditActive">
               <button class="text-button" type="button" @click="deleteDiagram">Delete diagram</button>
               <button class="primary-button" type="button" :disabled="!activeDiagram.structures.length" @click="startStudy">
                 <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M7 4.5 13 10l-6 5.5V4.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
                 Start practice
               </button>
+            </template>
+            <template v-else-if="mode === 'edit'">
+              <button class="primary-button" type="button" :disabled="!activeDiagram.structures.length" @click="startStudy">Practice this diagram</button>
             </template>
             <template v-else>
               <button class="text-button" type="button" @click="mode = 'edit'; resetStudy()">Back to edit</button>
@@ -780,6 +965,43 @@ function onDrop(event: DragEvent) {
                 {{ checked ? 'Try again' : 'Check answers' }}
               </button>
             </template>
+          </div>
+        </section>
+
+        <section class="organization-strip" aria-label="Diagram organization and sharing">
+          <template v-if="canEditActive">
+            <label class="metadata-field folder-field">
+              <span>FOLDER</span>
+              <select :value="activeDiagram.folderId ?? ''" aria-label="Place diagram in folder" @change="setDiagramFolder(($event.target as HTMLSelectElement).value)">
+                <option value="">Unfiled</option>
+                <option v-for="folder in availableFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option>
+              </select>
+            </label>
+            <label class="metadata-field visibility-field">
+              <span>VISIBILITY</span>
+              <select v-model="activeDiagram.visibility" aria-label="Diagram visibility">
+                <option value="private">Private</option>
+                <option value="public">Public</option>
+              </select>
+            </label>
+            <div class="metadata-field tags-field">
+              <span>TOPIC TAGS</span>
+              <div class="tag-list">
+                <span v-for="tag in activeDiagram.tags" :key="tag" class="topic-tag">{{ tag }}<button type="button" :aria-label="`Remove ${tag} tag`" @click="removeTag(tag)">×</button></span>
+                <form class="tag-entry" @submit.prevent="addTag">
+                  <input v-model="tagDraft" maxlength="30" aria-label="Add a topic tag" placeholder="Add a tag" />
+                  <button type="submit" :disabled="!tagDraft.trim()" aria-label="Add tag">＋</button>
+                </form>
+              </div>
+            </div>
+          </template>
+          <div v-else class="public-readonly"><span class="public-icon">↗</span><span><strong>Public diagram</strong><small>Shared by another learner · Read only</small></span><div class="public-tag-list"><span v-for="tag in activeDiagram.tags" :key="tag" class="topic-tag">{{ tag }}</span></div></div>
+          <div v-if="activeDiagram.visibility === 'public'" class="share-action">
+            <button class="text-button share-button" type="button" @click="copyShareLink">
+              <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M8 12 12 8m-5.5 6H5a3 3 0 0 1 0-6h2m6 4h2a3 3 0 0 0 0-6h-1.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+              Copy share link
+            </button>
+            <span v-if="shareMessage" class="share-message">{{ shareMessage }}</span>
           </div>
         </section>
 
@@ -795,7 +1017,7 @@ function onDrop(event: DragEvent) {
               <div class="canvas-caption"><span class="caption-icon">⌗</span><span>{{ mode === 'study' ? 'IDENTIFY THE CALLOUTS' : 'DIAGRAM CANVAS' }}</span></div>
               <div class="canvas-actions">
                 <span v-if="mode === 'edit'" class="image-dimensions">{{ activeDiagram.structures.length }} {{ activeDiagram.structures.length === 1 ? 'callout' : 'callouts' }}</span>
-                <button v-if="mode === 'edit'" class="icon-button" title="Replace diagram image" aria-label="Replace diagram image" type="button" :disabled="uploadBusy" @click="replaceImage">
+                <button v-if="mode === 'edit' && canEditActive" class="icon-button" title="Replace diagram image" aria-label="Replace diagram image" type="button" :disabled="uploadBusy" @click="replaceImage">
                   <svg viewBox="0 0 20 20" fill="none"><path d="M10 13V3m0 0L6.5 6.5M10 3l3.5 3.5M4 11.5v4h12v-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 </button>
               </div>
@@ -836,7 +1058,7 @@ function onDrop(event: DragEvent) {
               </template>
               <template v-for="(structure, index) in activeDiagram.structures" :key="`label-${structure.id}`">
                 <button
-                  v-if="mode === 'edit' && !placing"
+                  v-if="mode === 'edit' && canEditActive && !placing"
                   class="callout-number"
                   :class="{ dragging: draggingLabelId === structure.id }"
                   :style="{ left: `${getLabelPosition(structure).x}%`, top: `${getLabelPosition(structure).y}%` }"
@@ -890,7 +1112,7 @@ function onDrop(event: DragEvent) {
             </div>
 
             <button
-              v-if="mode === 'edit'"
+              v-if="mode === 'edit' && canEditActive"
               class="add-structure-button"
               :class="{ active: placing }"
               :aria-pressed="placing"
@@ -920,10 +1142,11 @@ function onDrop(event: DragEvent) {
                 :class="{ 'answer-correct': mode === 'study' && checked && isCorrect(structure), 'answer-wrong': mode === 'study' && checked && !isCorrect(structure) }"
               >
                 <span class="row-number">{{ String(index + 1).padStart(2, '0') }}</span>
-                <div v-if="mode === 'edit'" class="structure-name-wrap">
+                <div v-if="mode === 'edit' && canEditActive" class="structure-name-wrap">
                   <input :value="structure.name" class="structure-name" :aria-label="`Label ${index + 1} name`" placeholder="Name this label" @input="setStructureName(structure, ($event.target as HTMLInputElement).value)" />
                   <button class="remove-button" :aria-label="`Remove ${structure.name || 'label'}`" title="Remove label" type="button" @click="removeStructure(structure.id)">×</button>
                 </div>
+                <span v-else-if="mode === 'edit'" class="public-label-name">{{ structure.name }}</span>
                 <div v-else class="answer-wrap">
                   <input
                     v-model="answers[structure.id]"
@@ -995,6 +1218,19 @@ function onDrop(event: DragEvent) {
         </div>
       </form>
     </div>
+    <div v-if="newFolderOpen" class="modal-scrim" @click.self="newFolderOpen = false">
+      <form class="name-modal" @submit.prevent="createFolder">
+        <div class="modal-kicker">YOUR LIBRARY <span>{{ folders.length }} FOLDERS</span></div>
+        <h2>New Folder</h2>
+        <p>Create a folder to group diagrams by course, system, or topic.</p>
+        <label class="modal-label" for="new-folder-name">FOLDER NAME</label>
+        <input id="new-folder-name" ref="newFolderNameInput" v-model="newFolderName" class="modal-input" maxlength="80" placeholder="e.g. Cardiovascular" />
+        <div class="modal-actions">
+          <button class="text-button" type="button" @click="newFolderOpen = false">Cancel</button>
+          <button class="primary-button" type="submit" :disabled="!newFolderName.trim() || folderBusy">{{ folderBusy ? 'Creating…' : 'Create folder' }}</button>
+        </div>
+      </form>
+    </div>
     </template>
   </div>
 </template>
@@ -1034,6 +1270,16 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .new-button:hover { background: #fff; border-color: #aebdaf; }
 .plus { font-size: 18px; font-weight: 400; line-height: 1; }
 .library-heading { display: flex; justify-content: space-between; align-items: center; margin: 32px 9px 10px; color: #7d837a; font-family: var(--mono); font-size: 10px; letter-spacing: .11em; text-transform: uppercase; }
+.library-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; margin: 0 2px 10px; padding: 3px; border: 1px solid #e0e4dc; border-radius: 4px; background: #eaede6; }
+.library-tabs button { min-height: 28px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: #7f867c; font-size: 10px; cursor: pointer; }
+.library-tabs button.active { border-color: #dce2d9; background: #fbfcf8; color: #4c664e; box-shadow: 0 1px 2px #263b260d; }
+.mobile-library-tabs { display: none; }
+.new-folder-button { display: flex; min-height: 30px; align-items: center; justify-content: center; gap: 6px; margin: 0 2px 9px; border: 1px dashed #cbd5c8; border-radius: 3px; background: #f7f9f4; color: #5e795f; font-size: 10px; font-weight: 600; cursor: pointer; }
+.new-folder-button span { font-size: 15px; font-weight: 400; }
+.new-folder-button:hover { border-color: #88a088; background: #f0f4ed; }
+.mobile-new-folder { display: none; }
+.folder-filter-label { display: flex; flex-direction: column; gap: 5px; margin: 2px 7px 8px; color: #90968c; font-family: var(--mono); font-size: 8px; letter-spacing: .09em; }
+.folder-filter-label select { min-width: 0; height: 29px; padding: 0 7px; border: 1px solid #dfe3da; border-radius: 3px; background: #f8f9f5; color: #647061; font-family: 'DM Sans', sans-serif; font-size: 10px; letter-spacing: 0; }
 .count { display: grid; width: 21px; height: 21px; place-items: center; border-radius: 50%; background: #e4e8df; color: #637262; font-size: 10px; letter-spacing: 0; }
 .diagram-list { display: flex; flex-direction: column; gap: 3px; }
 .diagram-link { position: relative; display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px; border: 0; border-radius: 5px; background: transparent; text-align: left; cursor: pointer; transition: background .16s; }
@@ -1063,6 +1309,31 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .local-tag { display: flex; align-items: center; gap: 7px; color: #838980; font-family: var(--mono); font-size: 8px; letter-spacing: .08em; }
 .avatar { display: grid; width: 29px; height: 29px; place-items: center; border: 1px solid #d7ddd3; border-radius: 50%; background: #e8ede5; color: #55715b; font-family: var(--serif); font-size: 15px; }
 .page-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 36px 0 27px; }
+.organization-strip { display: flex; flex-wrap: wrap; align-items: end; gap: 15px 19px; margin: -12px 0 22px; padding: 12px 13px; border: 1px solid #e2e6dd; border-radius: 4px; background: #f9faf6; }
+.metadata-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: #838b80; font-family: var(--mono); font-size: 8px; letter-spacing: .1em; }
+.metadata-field input, .metadata-field select { height: 30px; padding: 0 8px; border: 1px solid #dfe4db; border-radius: 3px; background: #fff; color: #465247; font-family: 'DM Sans', sans-serif; font-size: 10px; letter-spacing: 0; }
+.metadata-field input::placeholder { color: #a5aba1; }
+.folder-field { width: min(190px, 100%); }
+.visibility-field { width: 116px; }
+.tags-field { flex: 1 1 230px; }
+.tag-list { display: flex; min-height: 30px; flex-wrap: wrap; align-items: center; gap: 5px; }
+.topic-tag { display: inline-flex; align-items: center; gap: 5px; min-height: 23px; padding: 0 6px 0 8px; border: 1px solid #dce5d9; border-radius: 3px; background: #eff4ed; color: #587259; font-family: 'DM Sans', sans-serif; font-size: 9px; letter-spacing: 0; }
+.topic-tag button { width: 14px; height: 14px; padding: 0; border: 0; background: transparent; color: #7c8d78; font-size: 13px; line-height: 1; cursor: pointer; }
+.tag-entry { display: flex; height: 27px; align-items: center; border: 1px dashed #d3dbd0; border-radius: 3px; background: #fff; }
+.tag-entry input { width: 90px; height: 25px; padding: 0 7px; border: 0; outline: 0; background: transparent; color: #465247; font-size: 9px; }
+.tag-entry input::placeholder { color: #a5aba1; }
+.tag-entry button { width: 26px; height: 25px; border: 0; background: transparent; color: #5d7b60; font-size: 15px; cursor: pointer; }
+.tag-entry button:disabled { color: #b4bbb1; cursor: default; }
+.share-action { display: flex; flex: 1 0 100%; justify-content: end; align-items: center; gap: 10px; margin-top: -5px; }
+.share-button { display: inline-flex; align-items: center; gap: 5px; color: #547455; font-size: 10px; }
+.share-button svg { width: 15px; height: 15px; }
+.share-message { overflow-wrap: anywhere; color: #71816d; font-size: 9px; }
+.public-readonly { display: flex; align-items: center; gap: 9px; }
+.public-icon { display: grid; width: 28px; height: 28px; place-items: center; border: 1px solid #dce5d9; border-radius: 50%; color: #5f7c60; font-size: 15px; }
+.public-readonly strong, .public-readonly small { display: block; }
+.public-readonly strong { color: #597259; font-size: 10px; font-weight: 600; }
+.public-readonly small { margin-top: 2px; color: #92998f; font-size: 9px; }
+.public-tag-list { display: flex; flex-wrap: wrap; gap: 4px; margin-left: 8px; }
 .eyebrow { display: flex; align-items: center; gap: 8px; color: #879084; font-family: var(--mono); font-size: 9px; letter-spacing: .13em; }
 .eyebrow-line { width: 17px; height: 1px; background: #779179; }
 .title-input, .page-title { display: block; max-width: 720px; margin: 9px 0 3px; padding: 0; border: 0; outline: none; background: transparent; color: #29332d; font-family: var(--serif); font-size: 38px; font-weight: 400; line-height: 1.05; }
@@ -1134,6 +1405,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .row-number { display: grid; width: 25px; height: 22px; flex: 0 0 25px; place-items: center; border: 1px solid #e1e6dc; border-radius: 2px; color: #61775f; font-family: var(--mono); font-size: 9px; }
 .structure-name-wrap, .answer-wrap { display: flex; min-width: 0; flex: 1; flex-direction: column; }
 .structure-name { width: 100%; padding: 7px 0; border: 0; background: transparent; color: #39413a; font-size: 11px; }
+.public-label-name { min-width: 0; overflow-wrap: anywhere; color: #536254; font-size: 11px; }
 .structure-name::placeholder { color: #a6aaa2; }
 .structure-name:focus { outline: none; }
 .remove-button { display: none; position: absolute; right: 0; top: 4px; width: 22px; height: 22px; border: 0; border-radius: 3px; background: #f6f3ef; color: #9b655c; font-size: 17px; cursor: pointer; }
@@ -1252,13 +1524,22 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
   .sidebar { width: 67px; flex-basis: 67px; align-items: center; padding: 20px 8px; }
   .brand { margin: 0 0 28px; }
   .brand-name, .new-button:not(:has(.plus)), .library-heading, .diagram-link-copy, .active-dot, .sidebar-bottom { display: none; }
+  .sidebar .library-tabs, .sidebar .folder-filter-label { display: none; }
+  .sidebar .new-folder-button { display: none; }
   .new-button { width: 42px; min-width: 42px; padding: 0; font-size: 0; }
   .new-button .plus { font-size: 22px; }
   .diagram-list { width: 100%; margin-top: 14px; }
   .diagram-link { justify-content: center; padding: 5px 0; }
   .thumbnail { width: 40px; height: 40px; flex-basis: 40px; }
   .main-area { padding: 0 20px 30px; }
+  .mobile-library-tabs { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 10px 0 2px; }
+  .mobile-library-tabs > button { min-height: 30px; padding: 0 10px; border: 1px solid #e0e4dc; border-radius: 3px; background: #f8f9f5; color: #727b70; font-size: 10px; }
+  .mobile-library-tabs > button.active { border-color: #cbd8c9; background: #eaf0e8; color: #4c664e; }
+  .mobile-library-tabs .mobile-new-folder { display: inline-flex; min-height: 30px; margin: 0; padding: 0 9px; border: 1px dashed #cbd5c8; background: #f7f9f4; color: #5e795f; }
+  .mobile-filter { display: flex; align-items: center; gap: 5px; color: #858c81; font-size: 9px; }
+  .mobile-filter select { max-width: 140px; height: 29px; padding: 0 6px; border: 1px solid #dfe3da; border-radius: 3px; background: #f8f9f5; color: #647061; font-size: 9px; }
   .page-heading { align-items: start; flex-direction: column; gap: 16px; padding-top: 27px; }
+  .organization-strip { margin-top: -6px; }
   .heading-actions { width: 100%; justify-content: space-between; }
   .workbench { grid-template-columns: minmax(0, 1fr); }
   .image-column { border-right: 0; }
@@ -1279,6 +1560,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
   .new-button { width: 38px; min-width: 38px; min-height: 38px; }
   .thumbnail { width: 36px; height: 36px; flex-basis: 36px; }
   .main-area { padding-right: 13px; padding-left: 13px; }
+  .organization-strip { gap: 10px; padding: 10px; }
+  .folder-field { width: min(145px, 100%); }
+  .visibility-field { width: 102px; }
   .topbar { min-height: 57px; }
   .local-tag { display: none; }
   .title-input, .page-title { font-size: 31px; }
