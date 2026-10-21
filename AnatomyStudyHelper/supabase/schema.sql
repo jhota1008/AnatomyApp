@@ -13,6 +13,10 @@ create table public.structures (
   name text not null,
   x double precision not null check (x >= 0 and x <= 100),
   y double precision not null check (y >= 0 and y <= 100),
+  label_x double precision check (label_x is null or (label_x >= 0 and label_x <= 100)),
+  label_y double precision check (label_y is null or (label_y >= 0 and label_y <= 100)),
+  target_type text not null default 'point' check (target_type in ('point', 'circle')),
+  radius double precision check (radius is null or (radius > 0 and radius <= 25)),
   position integer not null default 0
 );
 

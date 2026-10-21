@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
 
@@ -8,6 +8,10 @@ type Structure = {
   name: string
   x: number
   y: number
+  labelX?: number | null
+  labelY?: number | null
+  targetType?: 'point' | 'circle'
+  radius?: number | null
 }
 
 type Diagram = {
@@ -29,12 +33,25 @@ const legacyDiagrams = ref<LocalDiagram[]>([])
 const selectedId = ref('')
 const mode = ref<'edit' | 'study'>('edit')
 const placing = ref(false)
-const pendingPoint = ref<{ x: number; y: number } | null>(null)
+const pendingPoint = ref<{
+  x: number
+  y: number
+  labelX: number
+  labelY: number
+  targetType: 'point' | 'circle'
+  radius: number | null
+} | null>(null)
+const labelTargetType = ref<'point' | 'circle'>('point')
+const circleStart = ref<{ x: number; y: number } | null>(null)
+const circleDraft = ref<{ x: number; y: number; radius: number } | null>(null)
 const structureName = ref('')
 const answers = ref<Record<string, string>>({})
 const checked = ref(false)
 const replacingImage = ref(false)
 const imageInput = ref<HTMLInputElement | null>(null)
+const structureNameInput = ref<HTMLInputElement | null>(null)
+const diagramStage = ref<HTMLElement | null>(null)
+const draggingLabelId = ref<string | null>(null)
 const user = ref<User | null>(null)
 const cloudReady = ref(false)
 const authMode = ref<'signin' | 'signup'>('signin')
@@ -163,7 +180,7 @@ async function loadCloudDiagrams() {
   try {
     const { data, error } = await supabase
       .from('diagrams')
-      .select('id, title, image_path, updated_at, structures(id, name, x, y, position)')
+      .select('id, title, image_path, updated_at, structures(id, name, x, y, label_x, label_y, target_type, radius, position)')
       .eq('user_id', user.value.id)
       .order('updated_at', { ascending: false })
     if (error) throw error
@@ -182,7 +199,16 @@ async function loadCloudDiagrams() {
         updatedAt: new Date(row.updated_at).getTime(),
         structures: [...(row.structures ?? [])]
           .sort((first, second) => first.position - second.position)
-          .map(({ id, name, x, y }) => ({ id, name, x, y })),
+          .map(({ id, name, x, y, label_x, label_y, target_type, radius }) => ({
+            id,
+            name,
+            x,
+            y,
+            labelX: label_x,
+            labelY: label_y,
+            targetType: target_type ?? 'point',
+            radius,
+          })),
       })
     }
     diagrams.value = loaded
@@ -340,7 +366,18 @@ async function persistDiagram(diagram: Diagram) {
     if (diagramError) throw diagramError
     if (diagram.structures.length) {
       const { error: structuresError } = await supabase.from('structures').upsert(
-        diagram.structures.map((structure, position) => ({ ...structure, diagram_id: diagram.id, position })),
+        diagram.structures.map((structure, position) => ({
+          id: structure.id,
+          name: structure.name,
+          x: structure.x,
+          y: structure.y,
+          label_x: getLabelPosition(structure).x,
+          label_y: getLabelPosition(structure).y,
+          target_type: structure.targetType ?? 'point',
+          radius: structure.targetType === 'circle' ? structure.radius : null,
+          diagram_id: diagram.id,
+          position,
+        })),
       )
       if (structuresError) throw structuresError
     }
@@ -363,16 +400,116 @@ function setStructureName(structure: Structure, value: string) {
   if (activeDiagram.value) activeDiagram.value.updatedAt = Date.now()
 }
 
-function onDiagramClick(event: MouseEvent) {
-  if (!placing.value || !activeDiagram.value) return
+async function onDiagramClick(event: MouseEvent) {
+  if (!placing.value || !activeDiagram.value || labelTargetType.value !== 'point') return
   const stage = event.currentTarget as HTMLElement
   const bounds = stage.getBoundingClientRect()
+  const x = clampCoordinate(((event.clientX - bounds.left) / bounds.width) * 100)
+  const y = clampCoordinate(((event.clientY - bounds.top) / bounds.height) * 100)
   pendingPoint.value = {
-    x: Math.max(0, Math.min(100, ((event.clientX - bounds.left) / bounds.width) * 100)),
-    y: Math.max(0, Math.min(100, ((event.clientY - bounds.top) / bounds.height) * 100)),
+    x,
+    y,
+    labelX: getDefaultLabelX(x),
+    labelY: clampCoordinate(y - 5),
+    targetType: 'point',
+    radius: null,
   }
   structureName.value = ''
-  placing.value = false
+  await nextTick()
+  structureNameInput.value?.focus()
+}
+
+function clampCoordinate(value: number) {
+  return Math.max(2, Math.min(98, value))
+}
+
+function getDefaultLabelX(x: number) {
+  return clampCoordinate(x + (x > 76 ? -9 : 9))
+}
+
+function getStageCoordinates(clientX: number, clientY: number) {
+  const bounds = diagramStage.value?.getBoundingClientRect()
+  if (!bounds) return { x: 0, y: 0 }
+  return {
+    x: clampCoordinate(((clientX - bounds.left) / bounds.width) * 100),
+    y: clampCoordinate(((clientY - bounds.top) / bounds.height) * 100),
+  }
+}
+
+function startCircle(event: PointerEvent) {
+  if (!placing.value || labelTargetType.value !== 'circle' || event.button !== 0) return
+  event.preventDefault()
+  const center = getStageCoordinates(event.clientX, event.clientY)
+  circleStart.value = center
+  circleDraft.value = { ...center, radius: 0.5 }
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+}
+
+function resizeCircle(event: PointerEvent) {
+  if (!circleStart.value || !diagramStage.value) return
+  const bounds = diagramStage.value.getBoundingClientRect()
+  const centerX = (circleStart.value.x / 100) * bounds.width
+  const centerY = (circleStart.value.y / 100) * bounds.height
+  const distance = Math.hypot(event.clientX - bounds.left - centerX, event.clientY - bounds.top - centerY)
+  const maxRadius = Math.min(centerX, bounds.width - centerX, centerY, bounds.height - centerY)
+  const radius = Math.min(distance, maxRadius, bounds.width * 0.25)
+  circleDraft.value = { ...circleStart.value, radius: Math.max(0.25, (radius / bounds.width) * 100) }
+}
+
+async function finishCircle(event: PointerEvent) {
+  if (!circleStart.value || !circleDraft.value) return
+  resizeCircle(event)
+  const draft = circleDraft.value
+  const radius = Math.max(0.25, draft.radius)
+  const labelX = clampCoordinate(draft.x + (draft.x > 76 ? -(radius + 3) : radius + 3))
+  pendingPoint.value = {
+    x: draft.x,
+    y: draft.y,
+    labelX,
+    labelY: clampCoordinate(draft.y - radius - 3),
+    targetType: 'circle',
+    radius,
+  }
+  circleStart.value = null
+  circleDraft.value = null
+  structureName.value = ''
+  await nextTick()
+  structureNameInput.value?.focus()
+}
+
+function getLabelPosition(structure: Pick<Structure, 'x' | 'y' | 'labelX' | 'labelY'>) {
+  return {
+    x: structure.labelX ?? getDefaultLabelX(structure.x),
+    y: structure.labelY ?? clampCoordinate(structure.y - 5),
+  }
+}
+
+function startLabelDrag(event: PointerEvent, structure: Structure) {
+  if (event.button !== 0 || placing.value) return
+  event.preventDefault()
+  draggingLabelId.value = structure.id
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+}
+
+function moveLabel(event: PointerEvent) {
+  const structure = activeDiagram.value?.structures.find((item) => item.id === draggingLabelId.value)
+  const stage = diagramStage.value
+  if (!structure || !stage) return
+  const bounds = stage.getBoundingClientRect()
+  const label = event.currentTarget as HTMLElement
+  const halfWidth = (label.offsetWidth / bounds.width) * 50
+  const halfHeight = (label.offsetHeight / bounds.height) * 50
+  structure.labelX = Math.max(halfWidth, Math.min(100 - halfWidth, ((event.clientX - bounds.left) / bounds.width) * 100))
+  structure.labelY = Math.max(halfHeight, Math.min(100 - halfHeight, ((event.clientY - bounds.top) / bounds.height) * 100))
+}
+
+function endLabelDrag() {
+  draggingLabelId.value = null
+}
+
+function cancelCircle() {
+  circleStart.value = null
+  circleDraft.value = null
 }
 
 function addStructure() {
@@ -454,7 +591,18 @@ async function importLocalDiagrams() {
       }
       if (localDiagram.structures.length) {
         const { error: structuresError } = await supabase.from('structures').insert(
-          localDiagram.structures.map((structure, position) => ({ ...structure, diagram_id: localDiagram.id, position })),
+          localDiagram.structures.map((structure, position) => ({
+            id: structure.id,
+            name: structure.name,
+            x: structure.x,
+            y: structure.y,
+            label_x: getLabelPosition(structure).x,
+            label_y: getLabelPosition(structure).y,
+            target_type: structure.targetType ?? 'point',
+            radius: structure.targetType === 'circle' ? structure.radius : null,
+            diagram_id: localDiagram.id,
+            position,
+          })),
         )
         if (structuresError) {
           await supabase.from('diagrams').delete().eq('id', localDiagram.id)
@@ -517,7 +665,7 @@ function onDrop(event: DragEvent) {
         <template v-else>
           <div class="eyebrow"><span class="eyebrow-line"></span> YOUR PRIVATE STUDY LIBRARY</div>
           <h1>{{ authMode === 'signin' ? 'Welcome back.' : 'Make it yours.' }}<br /><em>{{ authMode === 'signin' ? 'Pick up where you left off.' : 'Create your account.' }}</em></h1>
-          <p class="auth-description">Your diagrams and structure labels sync securely to your account.</p>
+          <p class="auth-description">Your diagrams and labels sync securely to your account.</p>
           <form class="auth-form" @submit.prevent="handleAuth">
             <label for="auth-email">EMAIL ADDRESS</label>
             <input id="auth-email" v-model="authEmail" type="email" autocomplete="email" required placeholder="you@example.com" />
@@ -575,7 +723,7 @@ function onDrop(event: DragEvent) {
           <span class="thumbnail"><img :src="diagram.image" :alt="''" /></span>
           <span class="diagram-link-copy">
             <span class="diagram-link-title">{{ diagram.title }}</span>
-            <span class="diagram-link-meta">{{ diagram.structures.length }} structures · {{ formatDate(diagram.updatedAt) }}</span>
+            <span class="diagram-link-meta">{{ diagram.structures.length }} labels · {{ formatDate(diagram.updatedAt) }}</span>
           </span>
           <span class="active-dot"></span>
         </button>
@@ -616,7 +764,7 @@ function onDrop(event: DragEvent) {
               @input="setTitle(($event.target as HTMLInputElement).value)"
             />
             <h1 v-else class="page-title">{{ activeDiagram.title }}<span class="study-label">Practice</span></h1>
-            <p class="subtitle">{{ mode === 'study' ? 'Name each structure from memory.' : 'Build a visual study sheet, one structure at a time.' }}</p>
+            <p class="subtitle">{{ mode === 'study' ? 'Name each label from memory.' : 'Build a visual study sheet, one label at a time.' }}</p>
           </div>
           <div class="heading-actions">
             <template v-if="mode === 'edit'">
@@ -637,7 +785,7 @@ function onDrop(event: DragEvent) {
 
         <div v-if="mode === 'study' && checked" class="result-banner" :class="{ complete: correctCount === activeDiagram.structures.length }">
           <span class="result-mark">{{ correctCount === activeDiagram.structures.length ? '✓' : '·' }}</span>
-          <span><strong>{{ correctCount }} of {{ activeDiagram.structures.length }} correct</strong><small>{{ correctCount === activeDiagram.structures.length ? 'Excellent recall. Keep it fresh with another round.' : 'Review the missed structures, then give it another go.' }}</small></span>
+          <span><strong>{{ correctCount }} of {{ activeDiagram.structures.length }} correct</strong><small>{{ correctCount === activeDiagram.structures.length ? 'Excellent recall. Keep it fresh with another round.' : 'Review the missed labels, then give it another go.' }}</small></span>
           <button type="button" @click="resetStudy">Clear answers</button>
         </div>
 
@@ -654,8 +802,13 @@ function onDrop(event: DragEvent) {
             </div>
             <div
               class="diagram-stage"
-              :class="{ placing }"
+              ref="diagramStage"
+              :class="{ placing, 'placing-circle': placing && labelTargetType === 'circle' }"
               @click="onDiagramClick"
+              @pointerdown="startCircle"
+              @pointermove="resizeCircle"
+              @pointerup="finishCircle"
+              @pointercancel="cancelCircle"
               @dragover.prevent
               @drop.prevent="onDrop"
             >
@@ -666,22 +819,63 @@ function onDrop(event: DragEvent) {
                   :key="`line-${structure.id}`"
                   :x1="`${structure.x}%`"
                   :y1="`${structure.y}%`"
-                  :x2="`${structure.x + (structure.x > 76 ? -9 : 9)}%`"
-                  :y2="`${structure.y - 5}%`"
+                  :x2="`${getLabelPosition(structure).x}%`"
+                  :y2="`${getLabelPosition(structure).y}%`"
                 />
               </svg>
+              <template v-for="(structure, index) in activeDiagram.structures" :key="`target-${structure.id}`">
+                <div
+                  v-if="structure.targetType === 'circle'"
+                  class="target-circle"
+                  :style="{ left: `${structure.x}%`, top: `${structure.y}%`, width: `${(structure.radius ?? 2) * 2}%` }"
+                  aria-hidden="true"
+                ></div>
+                <div v-else class="callout-target" :style="{ left: `${structure.x}%`, top: `${structure.y}%` }" aria-hidden="true">
+                  <span class="target-dot"></span>
+                </div>
+              </template>
+              <template v-for="(structure, index) in activeDiagram.structures" :key="`label-${structure.id}`">
+                <button
+                  v-if="mode === 'edit' && !placing"
+                  class="callout-number"
+                  :class="{ dragging: draggingLabelId === structure.id }"
+                  :style="{ left: `${getLabelPosition(structure).x}%`, top: `${getLabelPosition(structure).y}%` }"
+                  type="button"
+                  :aria-label="`Drag label ${structure.name} to reposition it`"
+                  :title="`Drag to move ${structure.name}`"
+                  @pointerdown.stop="startLabelDrag($event, structure)"
+                  @pointermove.stop="moveLabel"
+                  @pointerup.stop="endLabelDrag"
+                  @pointercancel.stop="endLabelDrag"
+                  @lostpointercapture.stop="endLabelDrag"
+                  @click.stop
+                >
+                  <span class="callout-index">{{ String(index + 1).padStart(2, '0') }}</span>
+                  <span class="callout-label-name">{{ structure.name || 'Unnamed label' }}</span>
+                </button>
+                <span
+                  v-else-if="mode === 'edit'"
+                  class="callout-number"
+                  :style="{ left: `${getLabelPosition(structure).x}%`, top: `${getLabelPosition(structure).y}%` }"
+                >
+                  <span class="callout-index">{{ String(index + 1).padStart(2, '0') }}</span>
+                  <span class="callout-label-name">{{ structure.name || 'Unnamed label' }}</span>
+                </span>
+                <span
+                  v-else
+                  class="callout-number practice-number"
+                  :style="{ left: `${getLabelPosition(structure).x}%`, top: `${getLabelPosition(structure).y}%` }"
+                >{{ String(index + 1).padStart(2, '0') }}</span>
+              </template>
               <div
-                v-for="(structure, index) in activeDiagram.structures"
-                :key="structure.id"
-                class="callout"
-                :style="{ left: `${structure.x}%`, top: `${structure.y}%` }"
-              >
-                <span class="target-dot"></span>
-                <span class="callout-number" :class="{ 'callout-left': structure.x > 76 }">{{ String(index + 1).padStart(2, '0') }}</span>
-              </div>
-              <div v-if="placing" class="placement-hint"><span>＋</span> Click a structure to place its arrow</div>
+                v-if="circleDraft"
+                class="target-circle circle-draft"
+                :style="{ left: `${circleDraft.x}%`, top: `${circleDraft.y}%`, width: `${circleDraft.radius * 2}%` }"
+                aria-hidden="true"
+              ></div>
+              <div v-if="placing" class="placement-hint"><span>＋</span> {{ labelTargetType === 'point' ? 'Click a point to place the label' : 'Drag out a circle target' }}</div>
               <div v-if="!activeDiagram.structures.length && !placing" class="canvas-empty-tip">
-                <span class="tip-cross">＋</span><span>Start with a structure</span>
+                <span class="tip-cross">＋</span><span>Start with a label</span>
               </div>
             </div>
             <div class="canvas-footer">
@@ -692,16 +886,31 @@ function onDrop(event: DragEvent) {
 
           <aside class="structure-panel">
             <div class="panel-heading">
-              <div><div class="eyebrow panel-eyebrow">{{ mode === 'study' ? 'RECALL' : 'LABELS' }}</div><h2>{{ mode === 'study' ? 'Your answers' : 'Structures' }} <span>{{ activeDiagram.structures.length }}</span></h2></div>
-              <button v-if="mode === 'edit'" class="add-icon" type="button" title="Add a structure" aria-label="Add a structure" @click="placing = !placing; pendingPoint = null">
-                <svg viewBox="0 0 20 20" fill="none"><path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-              </button>
+              <div><div class="eyebrow panel-eyebrow">{{ mode === 'study' ? 'RECALL' : 'LABELS' }}</div><h2>{{ mode === 'study' ? 'Your answers' : 'Your labels' }} <span>{{ activeDiagram.structures.length }}</span></h2></div>
             </div>
 
-            <button v-if="mode === 'edit' && !placing" class="add-structure-button" type="button" @click="placing = true; pendingPoint = null">
-              <span>＋</span> Add structure
+            <button
+              v-if="mode === 'edit'"
+              class="add-structure-button"
+              :class="{ active: placing }"
+              :aria-pressed="placing"
+              type="button"
+              @click="placing = !placing; pendingPoint = null"
+            >
+              <span>{{ placing ? '✓' : '＋' }}</span> {{ placing ? 'Done adding' : 'Add label' }}
             </button>
-            <div v-if="mode === 'edit' && placing" class="placing-note"><span class="pulse-dot"></span> Click a point on the diagram</div>
+            <div v-if="mode === 'edit' && placing" class="placing-note"><span class="pulse-dot"></span> Choose a target type, then mark the diagram</div>
+            <div v-if="mode === 'edit' && placing" class="target-type-picker" role="group" aria-label="Label target type">
+              <button class="target-type-button" :class="{ selected: labelTargetType === 'point' }" type="button" :aria-pressed="labelTargetType === 'point'" @click="labelTargetType = 'point'; cancelCircle()">
+                <span class="point-symbol"></span> Point
+              </button>
+              <button class="target-type-button" :class="{ selected: labelTargetType === 'circle' }" type="button" :aria-pressed="labelTargetType === 'circle'" @click="labelTargetType = 'circle'; cancelCircle()">
+                <span class="circle-symbol"></span> Circle
+              </button>
+            </div>
+            <div v-if="mode === 'edit' && placing" class="placement-help">
+              {{ labelTargetType === 'point' ? 'Click the structure to set its point.' : 'Drag from the center outward to size a circle.' }}
+            </div>
 
             <div v-if="activeDiagram.structures.length" class="structure-list">
               <div
@@ -712,8 +921,8 @@ function onDrop(event: DragEvent) {
               >
                 <span class="row-number">{{ String(index + 1).padStart(2, '0') }}</span>
                 <div v-if="mode === 'edit'" class="structure-name-wrap">
-                  <input :value="structure.name" class="structure-name" :aria-label="`Structure ${index + 1} name`" placeholder="Name this structure" @input="setStructureName(structure, ($event.target as HTMLInputElement).value)" />
-                  <button class="remove-button" :aria-label="`Remove ${structure.name || 'structure'}`" title="Remove structure" type="button" @click="removeStructure(structure.id)">×</button>
+                  <input :value="structure.name" class="structure-name" :aria-label="`Label ${index + 1} name`" placeholder="Name this label" @input="setStructureName(structure, ($event.target as HTMLInputElement).value)" />
+                  <button class="remove-button" :aria-label="`Remove ${structure.name || 'label'}`" title="Remove label" type="button" @click="removeStructure(structure.id)">×</button>
                 </div>
                 <div v-else class="answer-wrap">
                   <input
@@ -721,7 +930,7 @@ function onDrop(event: DragEvent) {
                     class="answer-input"
                     :class="{ correct: checked && isCorrect(structure), incorrect: checked && !isCorrect(structure) }"
                     :disabled="checked"
-                    :placeholder="checked && !isCorrect(structure) ? structure.name : 'Type the structure name'"
+                    :placeholder="checked && !isCorrect(structure) ? structure.name : 'Type the label name'"
                     :aria-label="`Answer for callout ${index + 1}`"
                     @keyup.enter="!checked && (checked = true)"
                   />
@@ -731,13 +940,13 @@ function onDrop(event: DragEvent) {
             </div>
             <div v-else-if="mode === 'edit'" class="empty-structures">
               <span class="empty-structure-icon">↗</span>
-              <p>No structures yet</p>
-              <small>Add a label, then click its location on the image.</small>
+              <p>No labels yet</p>
+              <small>Add a label, then choose a point or draw a circle around its target.</small>
             </div>
-            <div v-else class="empty-structures"><p>No structures to practice</p></div>
+            <div v-else class="empty-structures"><p>No labels to practice</p></div>
 
             <div v-if="mode === 'study' && !checked" class="practice-note"><span>↵</span> Press Enter to check your answers</div>
-            <div v-if="mode === 'edit'" class="panel-tip"><span class="tip-star">✳</span><p><strong>Make it yours</strong><br />Place an arrow on the image, then name the structure it points to.</p></div>
+            <div v-if="mode === 'edit'" class="panel-tip"><span class="tip-star">✳</span><p><strong>Make it yours</strong><br />Place an arrow on the image, then name the label it points to.</p></div>
           </aside>
         </section>
       </template>
@@ -746,7 +955,7 @@ function onDrop(event: DragEvent) {
         <div class="welcome-copy">
           <div class="eyebrow"><span class="eyebrow-line"></span> A STUDY SPACE OF YOUR OWN</div>
           <h1>Learn the parts.<br /><em>Know them by heart.</em></h1>
-          <p>Turn your anatomy diagrams into active recall practice. Add your own image, mark the structures, then test what you remember.</p>
+          <p>Turn your anatomy diagrams into active recall practice. Add your own image, mark the labels, then test what you remember.</p>
           <button class="primary-button welcome-button" type="button" :disabled="uploadBusy" @click="openUpload"><span class="plus">+</span> {{ uploadBusy ? 'Uploading diagram…' : 'Upload your first diagram' }}</button>
           <div class="welcome-footnote"><span>↳</span> PNG, JPG, or WEBP · Saved privately in this browser</div>
         </div>
@@ -776,13 +985,13 @@ function onDrop(event: DragEvent) {
     <div v-if="pendingPoint" class="modal-scrim" @click.self="pendingPoint = null">
       <form class="name-modal" @submit.prevent="addStructure">
         <div class="modal-kicker">NEW CALLOUT <span>{{ String((activeDiagram?.structures.length ?? 0) + 1).padStart(2, '0') }}</span></div>
-        <h2>Name this structure</h2>
-        <p>Your arrow is placed. Give it a name to add it to your study list.</p>
-        <label class="modal-label" for="structure-name">STRUCTURE NAME</label>
-        <input id="structure-name" v-model="structureName" class="modal-input" autofocus placeholder="e.g. clavicle" />
+        <h2>Name this label</h2>
+        <p>Your arrow is placed. Name the label to add it to your study list.</p>
+        <label class="modal-label" for="structure-name">LABEL NAME</label>
+        <input id="structure-name" ref="structureNameInput" v-model="structureName" class="modal-input" placeholder="e.g. clavicle" />
         <div class="modal-actions">
           <button class="text-button" type="button" @click="pendingPoint = null">Cancel</button>
-          <button class="primary-button" type="submit" :disabled="!structureName.trim()">Add structure</button>
+          <button class="primary-button" type="submit" :disabled="!structureName.trim()">Add label</button>
         </div>
       </form>
     </div>
@@ -884,10 +1093,16 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .diagram-image { display: block; width: 100%; height: auto; user-select: none; }
 .leader-lines { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .leader-lines line { stroke: #527658; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-.callout { position: absolute; width: 1px; height: 1px; pointer-events: none; }
+.callout-target { position: absolute; width: 1px; height: 1px; pointer-events: none; }
 .target-dot { position: absolute; z-index: 1; top: -5px; left: -5px; width: 10px; height: 10px; border: 2px solid #fff; border-radius: 50%; background: #527658; box-shadow: 0 0 0 1px #527658; }
-.callout-number { position: absolute; top: calc(-5px - 1.1em); left: 25px; display: grid; min-width: 25px; height: 20px; place-items: center; padding: 0 4px; border: 1px solid #456c4d; border-radius: 2px; background: #f9fbf7; color: #456c4d; font-family: var(--mono); font-size: 9px; box-shadow: 0 1px 4px #1e2d201c; }
-.callout-number.callout-left { left: auto; right: 25px; }
+.target-circle { position: absolute; z-index: 1; aspect-ratio: 1; transform: translate(-50%, -50%); border: 1.5px solid #527658; border-radius: 50%; background: #52765820; pointer-events: none; }
+.target-circle::after { position: absolute; top: 50%; left: 50%; width: 6px; height: 6px; transform: translate(-50%, -50%); border: 1px solid #fff; border-radius: 50%; background: #527658; box-shadow: 0 0 0 1px #527658; content: ''; }
+.circle-draft { z-index: 4; border-style: dashed; background: #52765830; }
+.callout-number { position: absolute; z-index: 2; display: flex; width: max-content; max-width: min(220px, 45vw); min-height: 22px; align-items: center; gap: 6px; padding: 3px 7px; transform: translate(-50%, -50%); border: 1px solid #456c4d; border-radius: 2px; background: #f9fbf7; color: #456c4d; box-shadow: 0 1px 4px #1e2d201c; text-align: left; cursor: grab; touch-action: none; user-select: none; }
+.callout-index { display: grid; min-width: 17px; min-height: 15px; flex: 0 0 auto; place-items: center; padding-right: 5px; border-right: 1px solid #d8e1d5; color: #456c4d; font-family: var(--mono); font-size: 9px; }
+.callout-label-name { min-width: 0; color: #39483a; font-family: 'DM Sans', sans-serif; font-size: 10px; font-weight: 500; line-height: 1.25; overflow-wrap: anywhere; }
+.practice-number { width: 25px; min-width: 25px; height: 20px; min-height: 20px; justify-content: center; padding: 0 4px; color: #456c4d; font-family: var(--mono); font-size: 9px; text-align: center; }
+.callout-number:active, .callout-number.dragging { z-index: 3; background: #eaf2e8; cursor: grabbing; }
 .canvas-empty-tip { position: absolute; right: 10px; bottom: 10px; display: flex; align-items: center; gap: 6px; padding: 6px 8px; border: 1px solid #e4e8df; border-radius: 3px; background: #fbfbf2e8; color: #7c8478; font-size: 9px; }
 .tip-cross { color: #537657; font-size: 14px; }
 .placement-hint { position: absolute; top: 10px; left: 50%; display: flex; align-items: center; gap: 6px; padding: 8px 11px; transform: translateX(-50%); border-radius: 3px; background: #345341ed; color: #fff; font-size: 10px; white-space: nowrap; pointer-events: none; }
@@ -904,7 +1119,15 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .add-structure-button { display: flex; height: 36px; align-items: center; justify-content: center; gap: 7px; border: 1px dashed #c9d2c6; border-radius: 3px; background: #f7f9f4; color: #5e795f; font-size: 10px; font-weight: 600; cursor: pointer; }
 .add-structure-button:hover { border-color: #78957a; background: #f1f5ee; }
 .add-structure-button span { font-size: 16px; font-weight: 400; }
+.add-structure-button.active { border-style: solid; border-color: #9db59b; background: #edf4ea; color: #4e704f; }
+.add-structure-button.active span { font-size: 12px; }
 .placing-note { display: flex; height: 36px; align-items: center; justify-content: center; gap: 7px; border: 1px solid #d7e1d5; border-radius: 3px; background: #eef4ec; color: #537358; font-size: 10px; }
+.target-type-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; margin-top: 8px; padding: 3px; border: 1px solid #e1e6dc; border-radius: 4px; background: #f4f6f1; }
+.target-type-button { display: flex; min-height: 32px; align-items: center; justify-content: center; gap: 7px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: #838a80; font-size: 10px; cursor: pointer; }
+.target-type-button.selected { border-color: #d5e0d2; background: #fff; color: #4f704f; box-shadow: 0 1px 2px #273c260c; }
+.point-symbol { width: 7px; height: 7px; border: 1.5px solid #668267; border-radius: 50%; background: #668267; box-shadow: 0 0 0 2px #66826725; }
+.circle-symbol { width: 12px; height: 12px; border: 1.5px solid #668267; border-radius: 50%; background: #66826718; }
+.placement-help { margin: 8px 1px 0; color: #858d82; font-size: 9px; line-height: 1.45; }
 .pulse-dot { width: 6px; height: 6px; border-radius: 50%; background: #638c65; animation: pulse 1.5s infinite; }
 .structure-list { display: flex; flex-direction: column; margin-top: 11px; }
 .structure-row { display: flex; min-height: 48px; align-items: center; gap: 9px; border-bottom: 1px solid #eeefe9; }
