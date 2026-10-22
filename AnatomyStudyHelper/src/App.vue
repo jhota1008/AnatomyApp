@@ -81,6 +81,7 @@ const authEmail = ref('')
 const authPassword = ref('')
 const authBusy = ref(false)
 const uploadBusy = ref(false)
+const uploadProgress = ref('')
 const importBusy = ref(false)
 const authMessage = ref('')
 const appError = ref('')
@@ -308,11 +309,13 @@ async function signOut() {
 
 function openUpload() {
   replacingImage.value = false
+  if (imageInput.value) imageInput.value.multiple = true
   imageInput.value?.click()
 }
 
 function replaceImage() {
   replacingImage.value = true
+  if (imageInput.value) imageInput.value.multiple = false
   imageInput.value?.click()
 }
 
@@ -334,14 +337,16 @@ async function uploadImage(file: File, diagramId: string) {
 
 async function handleFile(event: Event) {
   const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
+  const files = Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'))
   input.value = ''
-  if (!file || !file.type.startsWith('image/') || !supabase || !user.value) return
+  if (!files.length || !supabase || !user.value) return
 
   uploadBusy.value = true
   appError.value = ''
   try {
     if (replacingImage.value && activeDiagram.value) {
+      const file = files[0]
+      if (!file) return
       const diagram = activeDiagram.value
       const previousPath = diagram.imagePath
       const imagePath = await uploadImage(file, diagram.id)
@@ -367,48 +372,67 @@ async function handleFile(event: Event) {
       return
     }
 
-    const title = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ') || 'Untitled diagram'
-    const diagramId = crypto.randomUUID()
-    const imagePath = await uploadImage(file, diagramId)
-    const { error } = await supabase.from('diagrams').insert({
-      id: diagramId,
-      user_id: user.value.id,
-      title,
-      image_path: imagePath,
-      folder_id: null,
-      tags: [],
-      visibility: 'private',
-    })
-    if (error) {
-      await supabase.storage.from(storageBucket).remove([imagePath])
-      throw error
+    const created: Diagram[] = []
+    const failures: string[] = []
+    for (const [index, file] of files.entries()) {
+      uploadProgress.value = `Uploading ${index + 1} of ${files.length}`
+      const title = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ') || 'Untitled diagram'
+      const diagramId = crypto.randomUUID()
+      let imagePath = ''
+      try {
+        imagePath = await uploadImage(file, diagramId)
+        const { error } = await supabase.from('diagrams').insert({
+          id: diagramId,
+          user_id: user.value.id,
+          title,
+          image_path: imagePath,
+          folder_id: null,
+          tags: [],
+          visibility: 'private',
+        })
+        if (error) throw error
+
+        const { data: signedImage, error: signedError } = await supabase.storage
+          .from(storageBucket)
+          .createSignedUrl(imagePath, 60 * 60 * 24)
+        if (signedError) {
+          await supabase.from('diagrams').delete().eq('id', diagramId).eq('user_id', user.value.id)
+          throw signedError
+        }
+        created.push({
+          id: diagramId,
+          ownerId: user.value.id,
+          title,
+          image: signedImage.signedUrl,
+          imagePath,
+          folderId: null,
+          folderName: '',
+          tags: [],
+          visibility: 'private',
+          structures: [],
+          updatedAt: Date.now(),
+        })
+      } catch (error) {
+        if (imagePath) await supabase.storage.from(storageBucket).remove([imagePath])
+        failures.push(`${file.name}: ${getErrorMessage(error)}`)
+      }
     }
-    const { data: signedImage, error: signedError } = await supabase.storage
-      .from(storageBucket)
-      .createSignedUrl(imagePath, 60 * 60 * 24)
-    if (signedError) throw signedError
-    diagrams.value.unshift({
-      id: diagramId,
-      ownerId: user.value.id,
-      title,
-      image: signedImage.signedUrl,
-      imagePath,
-      folderId: null,
-      folderName: '',
-      tags: [],
-      visibility: 'private',
-      structures: [],
-      updatedAt: Date.now(),
-    })
-    selectedId.value = diagramId
-    libraryView.value = 'mine'
-    mode.value = 'edit'
-    resetStudy()
-    saveState.value = 'saved'
+
+    if (created.length) {
+      diagrams.value.unshift(...created)
+      selectedId.value = created[0]?.id ?? selectedId.value
+      libraryView.value = 'mine'
+      mode.value = 'edit'
+      resetStudy()
+      saveState.value = 'saved'
+    }
+    if (failures.length) appError.value = `Some images could not be added: ${failures.join(' · ')}`
   } catch (error) {
     appError.value = getErrorMessage(error)
   } finally {
     uploadBusy.value = false
+    uploadProgress.value = ''
+    replacingImage.value = false
   }
 }
 
@@ -860,7 +884,7 @@ function onDrop(event: DragEvent) {
       </a>
 
       <button class="new-button" type="button" :disabled="uploadBusy" @click="openUpload">
-        <span class="plus">+</span> New diagram
+        <span class="plus">{{ uploadBusy ? '…' : '+' }}</span> {{ uploadBusy ? uploadProgress : 'New diagram' }}
       </button>
 
       <div class="library-heading">
@@ -928,6 +952,7 @@ function onDrop(event: DragEvent) {
       </div>
 
       <div v-if="appError" class="app-alert" role="alert"><span>{{ appError }}</span><button type="button" aria-label="Dismiss error" @click="appError = ''">×</button></div>
+      <div v-if="uploadBusy" class="upload-progress" role="status" aria-live="polite"><span class="pulse-dot"></span>{{ uploadProgress || 'Uploading image…' }}. Keep this page open.</div>
       <div v-if="legacyDiagrams.length" class="import-banner">
         <div><strong>{{ legacyDiagrams.length }} locally saved {{ legacyDiagrams.length === 1 ? 'diagram' : 'diagrams' }} found</strong><small>Import them into your account? The local copies stay until each upload succeeds.</small></div>
         <button class="primary-button" type="button" :disabled="importBusy" @click="importLocalDiagrams">{{ importBusy ? 'Importing…' : 'Import diagrams' }}</button>
@@ -1179,8 +1204,8 @@ function onDrop(event: DragEvent) {
           <div class="eyebrow"><span class="eyebrow-line"></span> A STUDY SPACE OF YOUR OWN</div>
           <h1>Learn the parts.<br /><em>Know them by heart.</em></h1>
           <p>Turn your anatomy diagrams into active recall practice. Add your own image, mark the labels, then test what you remember.</p>
-          <button class="primary-button welcome-button" type="button" :disabled="uploadBusy" @click="openUpload"><span class="plus">+</span> {{ uploadBusy ? 'Uploading diagram…' : 'Upload your first diagram' }}</button>
-          <div class="welcome-footnote"><span>↳</span> PNG, JPG, or WEBP · Saved privately in this browser</div>
+          <button class="primary-button welcome-button" type="button" :disabled="uploadBusy" @click="openUpload"><span class="plus">+</span> {{ uploadBusy ? uploadProgress : 'Upload images' }}</button>
+          <div class="welcome-footnote"><span>↳</span> Select one or more PNG, JPG, or WEBP files</div>
         </div>
         <div class="welcome-art" aria-hidden="true">
           <div class="art-topline"><span>PLATE NO. 001</span><span>FIG. A</span></div>
@@ -1203,7 +1228,7 @@ function onDrop(event: DragEvent) {
       </section>
     </main>
 
-    <input ref="imageInput" class="visually-hidden" type="file" accept="image/*" @change="handleFile" />
+    <input ref="imageInput" class="visually-hidden" type="file" accept="image/*" :multiple="!replacingImage" @change="handleFile" />
 
     <div v-if="pendingPoint" class="modal-scrim" @click.self="pendingPoint = null">
       <form class="name-modal" @submit.prevent="addStructure">
@@ -1499,6 +1524,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .auth-plate .anatomy-sketch { width: min(64%, 320px); max-height: 92%; }
 .auth-plate-label { position: absolute; right: 18px; bottom: 18px; color: #899386; font-family: var(--mono); font-size: 8px; letter-spacing: .08em; }
 .app-alert { display: flex; justify-content: space-between; align-items: start; gap: 12px; margin-top: 15px; padding: 10px 12px; border: 1px solid #ead8d2; border-radius: 3px; background: #fbf3f0; color: #8b5145; font-size: 10px; line-height: 1.5; }
+.upload-progress { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 9px 12px; border: 1px solid #dce5d9; border-radius: 3px; background: #f1f5ee; color: #61745f; font-size: 10px; }
 .app-alert button { flex: 0 0 auto; padding: 0 2px; border: 0; background: transparent; color: inherit; font-size: 17px; line-height: 1; cursor: pointer; }
 .import-banner { display: flex; justify-content: space-between; align-items: center; gap: 15px; margin-top: 14px; padding: 11px 13px; border: 1px solid #dce5d9; border-radius: 4px; background: #f0f5ed; }
 .import-banner strong, .import-banner small { display: block; }
