@@ -12,6 +12,7 @@ create table public.diagrams (
   user_id uuid not null references auth.users (id) on delete cascade,
   title text not null default 'Untitled diagram',
   image_path text not null,
+  image_scale double precision not null default 100 check (image_scale >= 50 and image_scale <= 200),
   folder_id uuid references public.folders (id) on delete set null,
   tags text[] not null default '{}',
   visibility text not null default 'private' check (visibility in ('private', 'public')),

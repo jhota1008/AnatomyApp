@@ -20,6 +20,7 @@ type Diagram = {
   title: string
   image: string
   imagePath: string
+  imageScale: number
   folderId: string | null
   folderName: string
   tags: string[]
@@ -30,8 +31,22 @@ type Diagram = {
 
 type Folder = { id: string; name: string }
 
-type LocalDiagram = Omit<Diagram, 'imagePath' | 'ownerId' | 'folderId' | 'folderName' | 'tags' | 'visibility'> & {
+type QuizQuestion = {
+  diagramId: string
+  diagramTitle: string
+  image: string
+  imageScale: number
+  structure: Structure
+}
+
+type QuizResult = QuizQuestion & {
+  answer: string
+  correct: boolean
+}
+
+type LocalDiagram = Omit<Diagram, 'imagePath' | 'ownerId' | 'folderId' | 'folderName' | 'tags' | 'visibility' | 'imageScale'> & {
   imagePath?: string
+  imageScale?: number
   folderName?: string
   tags?: string[]
   visibility?: 'private' | 'public'
@@ -53,7 +68,7 @@ const folderBusy = ref(false)
 const tagFilter = ref('')
 const tagDraft = ref('')
 const shareMessage = ref('')
-const mode = ref<'edit' | 'study'>('edit')
+const mode = ref<'edit' | 'study' | 'quiz'>('edit')
 const placing = ref(false)
 const pendingPoint = ref<{
   x: number
@@ -69,6 +84,14 @@ const circleDraft = ref<{ x: number; y: number; radius: number } | null>(null)
 const structureName = ref('')
 const answers = ref<Record<string, string>>({})
 const checked = ref(false)
+const quizPickerOpen = ref(false)
+const quizFolderId = ref('')
+const quizQuestions = ref<QuizQuestion[]>([])
+const quizIndex = ref(0)
+const quizAnswer = ref('')
+const quizResults = ref<QuizResult[]>([])
+const quizFinished = ref(false)
+const quizAnswerInput = ref<HTMLInputElement | null>(null)
 const replacingImage = ref(false)
 const imageInput = ref<HTMLInputElement | null>(null)
 const structureNameInput = ref<HTMLInputElement | null>(null)
@@ -105,6 +128,8 @@ const correctCount = computed(() => {
   if (!activeDiagram.value) return 0
   return activeDiagram.value.structures.filter((structure) => isCorrect(structure)).length
 })
+const currentQuizQuestion = computed(() => quizQuestions.value[quizIndex.value])
+const quizScore = computed(() => quizResults.value.filter((result) => result.correct).length)
 
 watch(
   diagrams,
@@ -222,7 +247,7 @@ async function loadCloudDiagrams() {
 
     const { data, error } = await supabase
       .from('diagrams')
-      .select('id, user_id, title, image_path, folder_id, updated_at, tags, visibility, structures(id, name, x, y, label_x, label_y, target_type, radius, position)')
+      .select('id, user_id, title, image_path, image_scale, folder_id, updated_at, tags, visibility, structures(id, name, x, y, label_x, label_y, target_type, radius, position)')
       .or(`user_id.eq.${user.value.id},visibility.eq.public`)
       .order('updated_at', { ascending: false })
     if (error) throw error
@@ -239,6 +264,7 @@ async function loadCloudDiagrams() {
         title: row.title,
         image: signedImage.signedUrl,
         imagePath: row.image_path,
+        imageScale: row.image_scale ?? 100,
         folderId: row.folder_id,
         folderName: folders.value.find((folder) => folder.id === row.folder_id)?.name ?? '',
         tags: row.tags ?? [],
@@ -386,6 +412,7 @@ async function handleFile(event: Event) {
           user_id: user.value.id,
           title,
           image_path: imagePath,
+          image_scale: 100,
           folder_id: null,
           tags: [],
           visibility: 'private',
@@ -405,6 +432,7 @@ async function handleFile(event: Event) {
           title,
           image: signedImage.signedUrl,
           imagePath,
+          imageScale: 100,
           folderId: null,
           folderName: '',
           tags: [],
@@ -444,6 +472,7 @@ async function persistDiagram(diagram: Diagram) {
       .from('diagrams')
       .update({
         title: diagram.title,
+        image_scale: diagram.imageScale,
         folder_id: diagram.folderId,
         tags: diagram.tags,
         visibility: diagram.visibility,
@@ -567,6 +596,69 @@ function openDiagram(diagram: Diagram) {
   const url = new URL(window.location.href)
   url.searchParams.set('diagram', diagram.id)
   window.history.replaceState({}, '', url)
+}
+
+function shuffle<T>(items: T[]) {
+  return [...items].sort(() => Math.random() - 0.5)
+}
+
+async function openQuizPicker() {
+  quizFolderId.value = availableFolders.value[0]?.id ?? ''
+  quizPickerOpen.value = true
+  await nextTick()
+  document.getElementById('quiz-folder-select')?.focus()
+}
+
+async function startFolderQuiz() {
+  const questions = diagrams.value
+    .filter((diagram) => diagram.ownerId === user.value?.id && diagram.folderId === quizFolderId.value)
+    .flatMap((diagram) => diagram.structures.map((structure) => ({
+      diagramId: diagram.id,
+      diagramTitle: diagram.title,
+      image: diagram.image,
+      imageScale: diagram.imageScale,
+      structure,
+    })))
+  if (!questions.length) {
+    appError.value = 'This folder does not have any labels to quiz yet.'
+    quizPickerOpen.value = false
+    return
+  }
+  quizQuestions.value = shuffle(questions)
+  quizIndex.value = 0
+  quizAnswer.value = ''
+  quizResults.value = []
+  quizFinished.value = false
+  quizPickerOpen.value = false
+  mode.value = 'quiz'
+  await nextTick()
+  quizAnswerInput.value?.focus()
+}
+
+async function submitQuizAnswer() {
+  const question = currentQuizQuestion.value
+  if (!question || !quizAnswer.value.trim()) return
+  quizResults.value.push({
+    ...question,
+    answer: quizAnswer.value.trim(),
+    correct: quizAnswer.value.trim().toLocaleLowerCase() === question.structure.name.trim().toLocaleLowerCase(),
+  })
+  if (quizIndex.value >= quizQuestions.value.length - 1) {
+    quizFinished.value = true
+    return
+  }
+  quizIndex.value += 1
+  quizAnswer.value = ''
+  await nextTick()
+  quizAnswerInput.value?.focus()
+}
+
+function exitQuiz() {
+  mode.value = 'edit'
+  quizQuestions.value = []
+  quizResults.value = []
+  quizFinished.value = false
+  quizAnswer.value = ''
 }
 
 function setStructureName(structure: Structure, value: string) {
@@ -760,6 +852,7 @@ async function importLocalDiagrams() {
         user_id: user.value.id,
         title: localDiagram.title,
         image_path: imagePath,
+        image_scale: localDiagram.imageScale ?? 100,
         folder_id: folderId,
         tags: localDiagram.tags ?? [],
         visibility: localDiagram.visibility ?? 'private',
@@ -895,6 +988,7 @@ function onDrop(event: DragEvent) {
         <button type="button" role="tab" :aria-selected="libraryView === 'public'" :class="{ active: libraryView === 'public' }" @click="libraryView = 'public'; folderFilter = ''; tagFilter = ''">Public</button>
       </div>
       <button v-if="libraryView === 'mine'" class="new-folder-button" type="button" @click="openNewFolder"><span>＋</span> New Folder</button>
+      <button v-if="libraryView === 'mine' && availableFolders.length" class="quiz-folder-button" type="button" @click="openQuizPicker"><span>✦</span> Quiz a folder</button>
       <label v-if="libraryView === 'mine' && availableFolders.length" class="folder-filter-label">
         <span>FOLDER</span>
         <select v-model="folderFilter" aria-label="Filter by folder">
@@ -947,6 +1041,7 @@ function onDrop(event: DragEvent) {
         <button type="button" role="tab" :aria-selected="libraryView === 'mine'" :class="{ active: libraryView === 'mine' }" @click="libraryView = 'mine'; folderFilter = ''; tagFilter = ''">My diagrams</button>
         <button type="button" role="tab" :aria-selected="libraryView === 'public'" :class="{ active: libraryView === 'public' }" @click="libraryView = 'public'; folderFilter = ''; tagFilter = ''">Public library</button>
         <button v-if="libraryView === 'mine'" class="new-folder-button mobile-new-folder" type="button" @click="openNewFolder"><span>＋</span> New Folder</button>
+        <button v-if="libraryView === 'mine' && availableFolders.length" class="quiz-folder-button mobile-quiz-folder" type="button" @click="openQuizPicker"><span>✦</span> Quiz a folder</button>
         <label v-if="libraryView === 'mine' && availableFolders.length" class="mobile-filter"><span>Folder</span><select v-model="folderFilter"><option value="">All folders</option><option v-for="folder in availableFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
         <label v-if="availableTags.length" class="mobile-filter"><span>Topic</span><select v-model="tagFilter"><option value="">All topics</option><option v-for="tag in availableTags" :key="tag" :value="tag">{{ tag }}</option></select></label>
       </div>
@@ -959,7 +1054,61 @@ function onDrop(event: DragEvent) {
       </div>
       <div v-if="!cloudReady" class="loading-state"><span class="pulse-dot"></span> Loading your library…</div>
 
-      <template v-if="cloudReady && activeDiagram">
+      <section v-if="mode === 'quiz'" class="quiz-screen">
+        <div class="quiz-topline">
+          <div><div class="eyebrow"><span class="eyebrow-line"></span> FOLDER QUIZ</div><h1>{{ folders.find((folder) => folder.id === quizFolderId)?.name }}<span>{{ quizQuestions.length }} labels</span></h1></div>
+          <button class="text-button" type="button" @click="exitQuiz">Exit quiz</button>
+        </div>
+
+        <template v-if="!quizFinished && currentQuizQuestion">
+          <div class="quiz-progress-row"><span>QUESTION {{ quizIndex + 1 }} OF {{ quizQuestions.length }}</span><span>{{ Math.round((quizIndex / quizQuestions.length) * 100) }}% complete</span></div>
+          <div class="quiz-card">
+            <div class="quiz-image-stage">
+              <img :src="currentQuizQuestion.image" :alt="currentQuizQuestion.diagramTitle" draggable="false" />
+              <svg class="quiz-leader-lines" aria-hidden="true">
+                <line
+                  :x1="`${currentQuizQuestion.structure.x}%`"
+                  :y1="`${currentQuizQuestion.structure.y}%`"
+                  :x2="`${getLabelPosition(currentQuizQuestion.structure).x}%`"
+                  :y2="`${getLabelPosition(currentQuizQuestion.structure).y}%`"
+                />
+              </svg>
+              <div
+                v-if="currentQuizQuestion.structure.targetType === 'circle'"
+                class="quiz-target-circle"
+                :style="{ left: `${currentQuizQuestion.structure.x}%`, top: `${currentQuizQuestion.structure.y}%`, width: `${(currentQuizQuestion.structure.radius ?? 2) * 2}%` }"
+              ></div>
+              <span v-else class="quiz-target-dot" :style="{ left: `${currentQuizQuestion.structure.x}%`, top: `${currentQuizQuestion.structure.y}%` }"></span>
+              <span
+                class="quiz-callout-number"
+                :style="{ left: `${getLabelPosition(currentQuizQuestion.structure).x}%`, top: `${getLabelPosition(currentQuizQuestion.structure).y}%` }"
+              >{{ String(quizIndex + 1).padStart(2, '0') }}</span>
+            </div>
+            <div class="quiz-prompt">
+              <div class="quiz-kicker">{{ currentQuizQuestion.diagramTitle }}</div>
+              <h2>What is this label pointing to?</h2>
+              <form @submit.prevent="submitQuizAnswer">
+                <input ref="quizAnswerInput" v-model="quizAnswer" class="quiz-answer-input" autofocus autocomplete="off" placeholder="Type your answer" aria-label="Quiz answer" />
+                <button class="primary-button" type="submit" :disabled="!quizAnswer.trim()">{{ quizIndex === quizQuestions.length - 1 ? 'Finish quiz' : 'Next question' }} <span>→</span></button>
+              </form>
+            </div>
+          </div>
+        </template>
+
+        <div v-else class="quiz-results">
+          <div class="quiz-score"><span class="quiz-score-number">{{ quizScore }}</span><span class="quiz-score-total">/ {{ quizResults.length }}</span><p>{{ quizScore === quizResults.length ? 'Perfect recall.' : 'Quiz complete.' }}</p></div>
+          <div class="quiz-results-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span> RESULTS</div><h2>{{ quizScore }} of {{ quizResults.length }} correct</h2></div><button class="primary-button" type="button" @click="startFolderQuiz">Try again</button></div>
+          <div v-if="quizResults.some((result) => !result.correct)" class="missed-list">
+            <div class="missed-heading">Review these labels</div>
+            <div v-for="(result, index) in quizResults.filter((item) => !item.correct)" :key="`${result.structure.id}-${index}`" class="missed-row">
+              <span class="row-number">{{ String(index + 1).padStart(2, '0') }}</span><span><strong>{{ result.structure.name }}</strong><small>{{ result.diagramTitle }} · Your answer: {{ result.answer || 'No answer' }}</small></span>
+            </div>
+          </div>
+          <div v-else class="perfect-result"><span>✓</span><p>Every label was recalled correctly. Nice work.</p></div>
+        </div>
+      </section>
+
+      <template v-else-if="cloudReady && activeDiagram">
         <section class="page-heading">
           <div>
             <div class="eyebrow"><span class="eyebrow-line"></span> YOUR STUDY MATERIAL</div>
@@ -1042,6 +1191,10 @@ function onDrop(event: DragEvent) {
               <div class="canvas-caption"><span class="caption-icon">⌗</span><span>{{ mode === 'study' ? 'IDENTIFY THE CALLOUTS' : 'DIAGRAM CANVAS' }}</span></div>
               <div class="canvas-actions">
                 <span v-if="mode === 'edit'" class="image-dimensions">{{ activeDiagram.structures.length }} {{ activeDiagram.structures.length === 1 ? 'callout' : 'callouts' }}</span>
+                <label v-if="mode === 'edit' && canEditActive" class="image-scale-control" title="Adjust image size">
+                  <span>SIZE {{ activeDiagram.imageScale }}%</span>
+                  <input v-model.number="activeDiagram.imageScale" type="range" min="50" max="200" step="5" aria-label="Image size" />
+                </label>
                 <button v-if="mode === 'edit' && canEditActive" class="icon-button" title="Replace diagram image" aria-label="Replace diagram image" type="button" :disabled="uploadBusy" @click="replaceImage">
                   <svg viewBox="0 0 20 20" fill="none"><path d="M10 13V3m0 0L6.5 6.5M10 3l3.5 3.5M4 11.5v4h12v-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 </button>
@@ -1050,6 +1203,7 @@ function onDrop(event: DragEvent) {
             <div
               class="diagram-stage"
               ref="diagramStage"
+              :style="{ width: `${activeDiagram.imageScale}%` }"
               :class="{ placing, 'placing-circle': placing && labelTargetType === 'circle' }"
               @click="onDiagramClick"
               @pointerdown="startCircle"
@@ -1256,6 +1410,21 @@ function onDrop(event: DragEvent) {
         </div>
       </form>
     </div>
+    <div v-if="quizPickerOpen" class="modal-scrim" @click.self="quizPickerOpen = false">
+      <form class="name-modal" @submit.prevent="startFolderQuiz">
+        <div class="modal-kicker">ACTIVE RECALL <span>{{ availableFolders.length }} FOLDERS</span></div>
+        <h2>Quiz a folder</h2>
+        <p>We’ll mix every label in the folder and ask one question at a time.</p>
+        <label class="modal-label" for="quiz-folder-select">CHOOSE FOLDER</label>
+        <select id="quiz-folder-select" v-model="quizFolderId" class="modal-input" required>
+          <option v-for="folder in availableFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option>
+        </select>
+        <div class="modal-actions">
+          <button class="text-button" type="button" @click="quizPickerOpen = false">Cancel</button>
+          <button class="primary-button" type="submit" :disabled="!quizFolderId">Start quiz</button>
+        </div>
+      </form>
+    </div>
     </template>
   </div>
 </template>
@@ -1303,6 +1472,10 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .new-folder-button span { font-size: 15px; font-weight: 400; }
 .new-folder-button:hover { border-color: #88a088; background: #f0f4ed; }
 .mobile-new-folder { display: none; }
+.quiz-folder-button { display: flex; min-height: 30px; align-items: center; justify-content: center; gap: 6px; margin: 0 2px 12px; border: 1px solid #d6e0d2; border-radius: 3px; background: #eaf1e7; color: #557557; font-size: 10px; font-weight: 600; cursor: pointer; }
+.quiz-folder-button span { font-size: 13px; }
+.quiz-folder-button:hover { border-color: #9ab49a; background: #e1ecdf; }
+.mobile-quiz-folder { display: none; }
 .folder-filter-label { display: flex; flex-direction: column; gap: 5px; margin: 2px 7px 8px; color: #90968c; font-family: var(--mono); font-size: 8px; letter-spacing: .09em; }
 .folder-filter-label select { min-width: 0; height: 29px; padding: 0 7px; border: 1px solid #dfe3da; border-radius: 3px; background: #f8f9f5; color: #647061; font-family: 'DM Sans', sans-serif; font-size: 10px; letter-spacing: 0; }
 .count { display: grid; width: 21px; height: 21px; place-items: center; border-radius: 50%; background: #e4e8df; color: #637262; font-size: 10px; letter-spacing: 0; }
@@ -1334,6 +1507,43 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .local-tag { display: flex; align-items: center; gap: 7px; color: #838980; font-family: var(--mono); font-size: 8px; letter-spacing: .08em; }
 .avatar { display: grid; width: 29px; height: 29px; place-items: center; border: 1px solid #d7ddd3; border-radius: 50%; background: #e8ede5; color: #55715b; font-family: var(--serif); font-size: 15px; }
 .page-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 36px 0 27px; }
+.quiz-screen { max-width: 900px; margin: 0 auto; padding: 45px 0 60px; }
+.quiz-topline { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding-bottom: 28px; border-bottom: 1px solid #e3e6de; }
+.quiz-topline h1 { display: flex; align-items: baseline; gap: 11px; margin: 10px 0 0; color: #29332d; font-family: var(--serif); font-size: 38px; font-weight: 400; }
+.quiz-topline h1 span { color: #8a9388; font-family: var(--mono); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.quiz-progress-row { display: flex; justify-content: space-between; margin: 25px 0 10px; color: #899287; font-family: var(--mono); font-size: 9px; letter-spacing: .08em; }
+.quiz-card { overflow: hidden; border: 1px solid #e1e5dc; border-radius: 5px; background: #fbfbf8; box-shadow: 0 8px 24px #273c2610; }
+.quiz-image-stage { position: relative; width: 100%; background: #f1f3ed; }
+.quiz-image-stage img { display: block; width: 100%; height: auto; }
+.quiz-leader-lines { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.quiz-leader-lines line { stroke: #527658; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.quiz-target-dot { position: absolute; width: 14px; height: 14px; transform: translate(-50%, -50%); border: 3px solid #fff; border-radius: 50%; background: #527658; box-shadow: 0 0 0 1px #527658, 0 2px 8px #20342344; }
+.quiz-target-circle { position: absolute; aspect-ratio: 1; transform: translate(-50%, -50%); border: 2px solid #527658; border-radius: 50%; background: #52765825; box-shadow: 0 1px 8px #20342322; }
+.quiz-target-circle::after { position: absolute; top: 50%; left: 50%; width: 7px; height: 7px; transform: translate(-50%, -50%); border: 2px solid #fff; border-radius: 50%; background: #527658; content: ''; }
+.quiz-callout-number { position: absolute; z-index: 2; display: grid; width: 28px; height: 22px; place-items: center; transform: translate(-50%, -50%); border: 1px solid #456c4d; border-radius: 2px; background: #f9fbf7; color: #456c4d; font-family: var(--mono); font-size: 9px; box-shadow: 0 1px 4px #1e2d201c; }
+.quiz-prompt { display: flex; align-items: end; justify-content: space-between; gap: 30px; padding: 22px 25px 24px; border-top: 1px solid #e5e8e0; }
+.quiz-kicker { margin-bottom: 7px; color: #839084; font-family: var(--mono); font-size: 8px; letter-spacing: .1em; text-transform: uppercase; }
+.quiz-prompt h2 { margin: 0; color: #354137; font-family: var(--serif); font-size: 25px; font-weight: 400; }
+.quiz-prompt form { display: flex; min-width: min(380px, 45%); gap: 9px; }
+.quiz-answer-input { min-width: 0; flex: 1; height: 39px; padding: 0 10px; border: 1px solid #d9e0d6; border-radius: 3px; background: #fff; color: #354137; font-size: 11px; }
+.quiz-answer-input::placeholder { color: #a5ada2; }
+.quiz-results { padding-top: 28px; }
+.quiz-score { display: flex; align-items: baseline; gap: 5px; color: #557458; }
+.quiz-score-number { font-family: var(--serif); font-size: 76px; line-height: .9; }
+.quiz-score-total { color: #9aa399; font-family: var(--mono); font-size: 14px; }
+.quiz-score p { margin: 0 0 0 12px; color: #6c786b; font-family: var(--serif); font-size: 19px; font-style: italic; }
+.quiz-results-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin: 29px 0 17px; padding-bottom: 15px; border-bottom: 1px solid #e3e6de; }
+.quiz-results-heading h2 { margin: 8px 0 0; color: #303b32; font-family: var(--serif); font-size: 26px; font-weight: 400; }
+.missed-list { overflow: hidden; border: 1px solid #e5e1dc; border-radius: 4px; background: #fbf8f5; }
+.missed-heading { padding: 11px 14px; border-bottom: 1px solid #ebe5df; color: #8d756b; font-family: var(--mono); font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
+.missed-row { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid #eeeae5; }
+.missed-row:last-child { border-bottom: 0; }
+.missed-row strong, .missed-row small { display: block; }
+.missed-row strong { color: #5f534d; font-size: 11px; font-weight: 600; }
+.missed-row small { margin-top: 3px; color: #a08f87; font-size: 9px; }
+.perfect-result { display: flex; align-items: center; gap: 10px; padding: 17px; border: 1px solid #dce7d9; border-radius: 4px; background: #f1f6ef; color: #527256; }
+.perfect-result span { font-size: 22px; }
+.perfect-result p { margin: 0; font-family: var(--serif); font-size: 17px; font-style: italic; }
 .organization-strip { display: flex; flex-wrap: wrap; align-items: end; gap: 15px 19px; margin: -12px 0 22px; padding: 12px 13px; border: 1px solid #e2e6dd; border-radius: 4px; background: #f9faf6; }
 .metadata-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: #838b80; font-family: var(--mono); font-size: 8px; letter-spacing: .1em; }
 .metadata-field input, .metadata-field select { height: 30px; padding: 0 8px; border: 1px solid #dfe4db; border-radius: 3px; background: #fff; color: #465247; font-family: 'DM Sans', sans-serif; font-size: 10px; letter-spacing: 0; }
@@ -1375,12 +1585,14 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .primary-button:disabled { border-color: #bdc6ba; background: #bdc6ba; cursor: not-allowed; }
 .primary-button svg { width: 17px; height: 17px; }
 .workbench { display: grid; grid-template-columns: minmax(0, 1fr) 285px; min-height: 390px; border: 1px solid #e2e5dc; border-radius: 5px; background: #fbfbf8; box-shadow: 0 7px 22px #273c2610; }
-.image-column { min-width: 0; padding: 0 22px 12px; border-right: 1px solid #e6e8e1; }
+.image-column { min-width: 0; overflow-x: auto; padding: 0 22px 12px; border-right: 1px solid #e6e8e1; }
 .canvas-toolbar { display: flex; height: 50px; justify-content: space-between; align-items: center; border-bottom: 1px solid #eceee7; }
 .canvas-caption { display: flex; align-items: center; gap: 8px; color: #81887f; font-family: var(--mono); font-size: 9px; letter-spacing: .09em; }
 .caption-icon { color: #638064; font-size: 17px; }
 .canvas-actions { display: flex; align-items: center; gap: 10px; }
 .image-dimensions { color: #a0a49b; font-family: var(--mono); font-size: 9px; }
+.image-scale-control { display: flex; align-items: center; gap: 6px; color: #899287; font-family: var(--mono); font-size: 8px; letter-spacing: .05em; white-space: nowrap; }
+.image-scale-control input { width: 74px; height: 3px; accent-color: #5d8062; cursor: pointer; }
 .icon-button, .add-icon { display: grid; width: 29px; height: 29px; place-items: center; border: 1px solid #e1e4dc; border-radius: 4px; background: transparent; color: #727b70; cursor: pointer; }
 .icon-button:hover, .add-icon:hover { border-color: #aebcae; background: #f2f5ef; }
 .icon-button svg, .add-icon svg { width: 16px; height: 16px; }
@@ -1552,6 +1764,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
   .brand-name, .new-button:not(:has(.plus)), .library-heading, .diagram-link-copy, .active-dot, .sidebar-bottom { display: none; }
   .sidebar .library-tabs, .sidebar .folder-filter-label { display: none; }
   .sidebar .new-folder-button { display: none; }
+  .sidebar .quiz-folder-button { display: none; }
   .new-button { width: 42px; min-width: 42px; padding: 0; font-size: 0; }
   .new-button .plus { font-size: 22px; }
   .diagram-list { width: 100%; margin-top: 14px; }
@@ -1566,6 +1779,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
   .mobile-filter select { max-width: 140px; height: 29px; padding: 0 6px; border: 1px solid #dfe3da; border-radius: 3px; background: #f8f9f5; color: #647061; font-size: 9px; }
   .page-heading { align-items: start; flex-direction: column; gap: 16px; padding-top: 27px; }
   .organization-strip { margin-top: -6px; }
+  .quiz-screen { padding: 28px 0 40px; }
+  .quiz-topline h1 { font-size: 31px; }
+  .quiz-image-stage { min-height: 0; }
+  .quiz-prompt { align-items: stretch; flex-direction: column; gap: 17px; padding: 18px; }
+  .quiz-prompt h2 { font-size: 23px; }
+  .quiz-prompt form { min-width: 0; }
   .heading-actions { width: 100%; justify-content: space-between; }
   .workbench { grid-template-columns: minmax(0, 1fr); }
   .image-column { border-right: 0; }
@@ -1589,6 +1808,13 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
   .organization-strip { gap: 10px; padding: 10px; }
   .folder-field { width: min(145px, 100%); }
   .visibility-field { width: 102px; }
+  .quiz-topline { align-items: start; flex-direction: column; gap: 13px; }
+  .quiz-topline h1 { font-size: 28px; }
+  .quiz-image-stage { min-height: 0; }
+  .quiz-prompt form { flex-direction: column; }
+  .quiz-prompt form .primary-button { width: 100%; }
+  .quiz-score-number { font-size: 62px; }
+  .quiz-results-heading { align-items: start; flex-direction: column; }
   .topbar { min-height: 57px; }
   .local-tag { display: none; }
   .title-input, .page-title { font-size: 31px; }
