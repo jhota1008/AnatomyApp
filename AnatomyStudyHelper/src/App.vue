@@ -55,6 +55,10 @@ type LocalDiagram = Omit<Diagram, 'imagePath' | 'ownerId' | 'folderId' | 'folder
 const storageKey = 'anatomy-study-diagrams'
 const databaseName = 'fieldnotes-anatomy'
 const storageBucket = 'anatomy-diagrams'
+const MAX_SOURCE_IMAGE_BYTES = 25 * 1024 * 1024
+const MAX_SOURCE_IMAGE_EDGE = 16000
+const MAX_BATCH_IMAGE_COUNT = 20
+const USER_STORAGE_LIMIT_BYTES = 250 * 1024 * 1024
 const diagrams = ref<Diagram[]>([])
 const folders = ref<Folder[]>([])
 const legacyDiagrams = ref<LocalDiagram[]>([])
@@ -98,10 +102,14 @@ const replacingImage = ref(false)
 const imageInput = ref<HTMLInputElement | null>(null)
 const structureNameInput = ref<HTMLInputElement | null>(null)
 const diagramStage = ref<HTMLElement | null>(null)
+const diagramImageFrame = ref<HTMLElement | null>(null)
+const diagramFitWidth = ref(600)
+const diagramFitHeight = ref(450)
+const diagramNaturalRatio = ref(4 / 3)
 const draggingLabelId = ref<string | null>(null)
 const user = ref<User | null>(null)
 const cloudReady = ref(false)
-const authMode = ref<'signin' | 'signup'>('signin')
+const authMode = ref<'signin' | 'signup' | 'reset'>('signin')
 const authEmail = ref('')
 const authPassword = ref('')
 const authBusy = ref(false)
@@ -109,6 +117,14 @@ const uploadBusy = ref(false)
 const uploadProgress = ref('')
 const importBusy = ref(false)
 const authMessage = ref('')
+const imageResizeOpen = ref(false)
+const pendingUploadFiles = ref<File[]>([])
+const imagePreviewUrl = ref('')
+const imagePreviewName = ref('')
+const originalImageWidth = ref(0)
+const originalImageHeight = ref(0)
+const resizeMaxEdge = ref(2400)
+const optimizedImageCount = ref(0)
 const appError = ref('')
 const saveState = ref<'saved' | 'saving' | 'error'>('saved')
 let saveTimer: number | undefined
@@ -116,6 +132,13 @@ let authSubscription: { unsubscribe: () => void } | undefined
 const pendingDiagramIds = new Set<string>()
 
 const activeDiagram = computed(() => diagrams.value.find((diagram) => diagram.id === selectedId.value))
+const diagramZoom = computed(() => {
+  const zoom = activeDiagram.value?.imageScale ?? 100
+  return Math.max(50, Math.min(200, zoom)) / 100
+})
+const diagramDisplayWidth = computed(() => diagramFitWidth.value * diagramZoom.value)
+const diagramDisplayHeight = computed(() => diagramFitHeight.value * diagramZoom.value)
+const diagramCanvasWidth = computed(() => diagramDisplayWidth.value + 64)
 const canEditActive = computed(() => Boolean(activeDiagram.value && user.value && activeDiagram.value.ownerId === user.value.id))
 const libraryDiagrams = computed(() => diagrams.value.filter((diagram) =>
     libraryView.value === 'mine' ? diagram.ownerId === user.value?.id : diagram.visibility === 'public',
@@ -175,11 +198,13 @@ onMounted(async () => {
   })
   authSubscription = authData.subscription
   window.addEventListener('focus', refreshImageUrls)
+  window.addEventListener('resize', updateDiagramFit)
 })
 
 onUnmounted(() => {
   authSubscription?.unsubscribe()
   window.removeEventListener('focus', refreshImageUrls)
+  window.removeEventListener('resize', updateDiagramFit)
   window.clearTimeout(saveTimer)
 })
 
@@ -307,13 +332,36 @@ async function refreshImageUrls() {
   }
 }
 
+function updateDiagramFit() {
+  const parentWidth = diagramStage.value?.parentElement?.clientWidth ?? 700
+  const availableWidth = Math.max(260, parentWidth - 108)
+  const maxHeight = Math.max(240, window.innerHeight - 330)
+  const fitWidth = Math.min(availableWidth, maxHeight * diagramNaturalRatio.value)
+  diagramFitWidth.value = Math.round(fitWidth)
+  diagramFitHeight.value = Math.round(fitWidth / diagramNaturalRatio.value)
+}
+
+function onDiagramImageLoad(event: Event) {
+  const image = event.currentTarget as HTMLImageElement
+  if (image.naturalWidth && image.naturalHeight) {
+    diagramNaturalRatio.value = image.naturalWidth / image.naturalHeight
+    void nextTick(updateDiagramFit)
+  }
+}
+
 async function handleAuth() {
   if (!supabase) return
   authBusy.value = true
   authMessage.value = ''
   appError.value = ''
   try {
-    if (authMode.value === 'signup') {
+    if (authMode.value === 'reset') {
+      const { error } = await supabase.auth.resetPasswordForEmail(authEmail.value.trim(), {
+        redirectTo: window.location.origin,
+      })
+      if (error) throw error
+      authMessage.value = 'Check your email for a password reset link.'
+    } else if (authMode.value === 'signup') {
       const { data, error } = await supabase.auth.signUp({ email: authEmail.value, password: authPassword.value })
       if (error) throw error
       if (!data.session) authMessage.value = 'Check your email for a confirmation link, then sign in.'
@@ -333,6 +381,16 @@ async function signOut() {
   if (!supabase) return
   const { error } = await supabase.auth.signOut()
   if (error) appError.value = error.message
+}
+
+function fitDiagram() {
+  if (!activeDiagram.value || !canEditActive.value) return
+  activeDiagram.value.imageScale = 100
+}
+
+function adjustDiagramZoom(change: number) {
+  if (!activeDiagram.value || !canEditActive.value) return
+  activeDiagram.value.imageScale = Math.max(50, Math.min(200, Math.round((activeDiagram.value.imageScale + change) / 25) * 25))
 }
 
 function openUpload() {
@@ -363,10 +421,75 @@ async function uploadImage(file: File, diagramId: string) {
   const imagePath = makeImagePath(diagramId, file.name)
   const { error } = await supabase.storage.from(storageBucket).upload(imagePath, file, {
     contentType: file.type,
+    cacheControl: '3600',
     upsert: false,
   })
   if (error) throw error
   return imagePath
+}
+
+async function getStorageUsageBytes() {
+  if (!supabase || !user.value) return 0
+  let total = 0
+  try {
+    const { data: diagramFolders, error } = await supabase.storage.from(storageBucket).list(user.value.id, { limit: 1000 })
+    if (error) throw error
+    for (const folder of diagramFolders ?? []) {
+      if (!folder.name) continue
+      const { data: files, error: listError } = await supabase.storage
+        .from(storageBucket)
+        .list(`${user.value.id}/${folder.name}`, { limit: 1000 })
+      if (listError) throw listError
+      for (const file of files ?? []) total += typeof file.metadata?.size === 'number' ? file.metadata.size : 0
+    }
+  } catch {
+    return 0
+  }
+  return total
+}
+
+async function getImageDimensions(file: File) {
+  const url = URL.createObjectURL(file)
+  try {
+    const dimensions = await new Promise<{ width: number; height: number }>((resolve, reject) => {
+      const image = new Image()
+      image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight })
+      image.onerror = () => reject(new Error(`Could not read ${file.name}.`))
+      image.src = url
+    })
+    return dimensions
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
+async function optimizeImage(file: File, maxEdge: number) {
+  const { width, height } = await getImageDimensions(file)
+  const scale = Math.min(1, maxEdge / Math.max(width, height))
+  const targetWidth = Math.max(1, Math.round(width * scale))
+  const targetHeight = Math.max(1, Math.round(height * scale))
+  const sourceUrl = URL.createObjectURL(file)
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const loaded = new Image()
+      loaded.onload = () => resolve(loaded)
+      loaded.onerror = () => reject(new Error(`Could not process ${file.name}.`))
+      loaded.src = sourceUrl
+    })
+    const canvas = document.createElement('canvas')
+    canvas.width = targetWidth
+    canvas.height = targetHeight
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Browser image processing is unavailable.')
+    context.drawImage(image, 0, 0, targetWidth, targetHeight)
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((result) => result ? resolve(result) : reject(new Error(`Could not convert ${file.name} to WebP.`)), 'image/webp', 0.82)
+    })
+    const baseName = file.name.replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_') || 'diagram'
+    return new File([blob], `${baseName}.webp`, { type: 'image/webp' })
+  } finally {
+    URL.revokeObjectURL(sourceUrl)
+  }
 }
 
 async function handleFile(event: Event) {
@@ -375,15 +498,86 @@ async function handleFile(event: Event) {
   input.value = ''
   if (!files.length || !supabase || !user.value) return
 
+  appError.value = ''
+  const rejected: string[] = []
+  const eligible: File[] = []
+  for (const file of files) {
+    if (file.size > MAX_SOURCE_IMAGE_BYTES) {
+      rejected.push(`${file.name}: file exceeds 25 MB`)
+      continue
+    }
+    try {
+      const { width, height } = await getImageDimensions(file)
+      if (width > MAX_SOURCE_IMAGE_EDGE || height > MAX_SOURCE_IMAGE_EDGE) {
+        rejected.push(`${file.name}: dimensions exceed 16,000 px`)
+        continue
+      }
+      eligible.push(file)
+    } catch {
+      rejected.push(`${file.name}: image could not be read`)
+    }
+  }
+  if (eligible.length > MAX_BATCH_IMAGE_COUNT) {
+    rejected.push(`A maximum of ${MAX_BATCH_IMAGE_COUNT} images can be uploaded at once`)
+    eligible.length = MAX_BATCH_IMAGE_COUNT
+  }
+  if (rejected.length) appError.value = rejected.join(' · ')
+  if (!eligible.length) return
+
+  pendingUploadFiles.value = eligible
+  optimizedImageCount.value = files.length
+  resizeMaxEdge.value = 2400
+  const firstFile = files[0]
+  if (!firstFile) return
+  imagePreviewName.value = files.length === 1 ? firstFile.name : `${files.length} images selected`
+  if (imagePreviewUrl.value) URL.revokeObjectURL(imagePreviewUrl.value)
+  imagePreviewUrl.value = URL.createObjectURL(firstFile)
+  const dimensions = await getImageDimensions(firstFile)
+  originalImageWidth.value = dimensions.width
+  originalImageHeight.value = dimensions.height
+  imageResizeOpen.value = true
+}
+
+function previewResizeDimensions() {
+  const scale = Math.min(1, resizeMaxEdge.value / Math.max(originalImageWidth.value, originalImageHeight.value))
+  return {
+    width: Math.max(1, Math.round(originalImageWidth.value * scale)),
+    height: Math.max(1, Math.round(originalImageHeight.value * scale)),
+  }
+}
+
+function closeImageResize() {
+  imageResizeOpen.value = false
+  pendingUploadFiles.value = []
+  replacingImage.value = false
+  optimizedImageCount.value = 0
+  if (imagePreviewUrl.value) URL.revokeObjectURL(imagePreviewUrl.value)
+  imagePreviewUrl.value = ''
+}
+
+async function confirmImageResize() {
+  if (!pendingUploadFiles.value.length || !supabase || !user.value) return
+  const files = [...pendingUploadFiles.value]
+  pendingUploadFiles.value = []
+  imageResizeOpen.value = false
+  if (imagePreviewUrl.value) URL.revokeObjectURL(imagePreviewUrl.value)
+  imagePreviewUrl.value = ''
   uploadBusy.value = true
   appError.value = ''
   try {
     if (replacingImage.value && activeDiagram.value) {
       const file = files[0]
       if (!file) return
+      uploadProgress.value = 'Optimizing image'
+      const optimizedFile = await optimizeImage(file, resizeMaxEdge.value)
+      const storageUsage = await getStorageUsageBytes()
+      if (storageUsage + optimizedFile.size > USER_STORAGE_LIMIT_BYTES) {
+        throw new Error('This upload would exceed the 250 MB account storage limit.')
+      }
       const diagram = activeDiagram.value
       const previousPath = diagram.imagePath
-      const imagePath = await uploadImage(file, diagram.id)
+      uploadProgress.value = 'Uploading image'
+      const imagePath = await uploadImage(optimizedFile, diagram.id)
       const { error } = await supabase
         .from('diagrams')
         .update({ image_path: imagePath, updated_at: new Date().toISOString() })
@@ -396,25 +590,47 @@ async function handleFile(event: Event) {
       const { data: signedImage, error: signedError } = await supabase.storage
         .from(storageBucket)
         .createSignedUrl(imagePath, 60 * 60 * 24)
-      if (signedError) throw signedError
+      if (signedError) {
+        await supabase
+          .from('diagrams')
+          .update({ image_path: previousPath })
+          .eq('id', diagram.id)
+          .eq('user_id', user.value.id)
+        await supabase.storage.from(storageBucket).remove([imagePath])
+        throw signedError
+      }
       diagram.imagePath = imagePath
       diagram.image = signedImage.signedUrl
       diagram.updatedAt = Date.now()
-      await supabase.storage.from(storageBucket).remove([previousPath])
+      const { error: removeError } = await supabase.storage.from(storageBucket).remove([previousPath])
+      if (removeError) appError.value = 'New image uploaded, but the previous image could not be removed.'
       replacingImage.value = false
       saveState.value = 'saved'
       return
     }
 
+    const optimizedFiles: File[] = []
+    for (const [index, file] of files.entries()) {
+      uploadProgress.value = `Optimizing ${index + 1} of ${files.length}`
+      optimizedFiles.push(await optimizeImage(file, resizeMaxEdge.value))
+    }
+    const optimizedBytes = optimizedFiles.reduce((total, file) => total + file.size, 0)
+    const storageUsage = await getStorageUsageBytes()
+    if (storageUsage + optimizedBytes > USER_STORAGE_LIMIT_BYTES) {
+      throw new Error('This upload would exceed the 250 MB account storage limit.')
+    }
+
     const created: Diagram[] = []
     const failures: string[] = []
     for (const [index, file] of files.entries()) {
+      const optimizedFile = optimizedFiles[index]
+      if (!optimizedFile) continue
       uploadProgress.value = `Uploading ${index + 1} of ${files.length}`
       const title = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ') || 'Untitled diagram'
       const diagramId = crypto.randomUUID()
       let imagePath = ''
       try {
-        imagePath = await uploadImage(file, diagramId)
+        imagePath = await uploadImage(optimizedFile, diagramId)
         const { error } = await supabase.from('diagrams').insert({
           id: diagramId,
           user_id: user.value.id,
@@ -678,7 +894,7 @@ function setStructureName(structure: Structure, value: string) {
 
 async function onDiagramClick(event: MouseEvent) {
   if (!placing.value || !activeDiagram.value || labelTargetType.value !== 'point') return
-  const stage = event.currentTarget as HTMLElement
+  const stage = diagramImageFrame.value ?? event.currentTarget as HTMLElement
   const bounds = stage.getBoundingClientRect()
   const x = clampCoordinate(((event.clientX - bounds.left) / bounds.width) * 100)
   const y = clampCoordinate(((event.clientY - bounds.top) / bounds.height) * 100)
@@ -704,7 +920,7 @@ function getDefaultLabelX(x: number) {
 }
 
 function getStageCoordinates(clientX: number, clientY: number) {
-  const bounds = diagramStage.value?.getBoundingClientRect()
+  const bounds = diagramImageFrame.value?.getBoundingClientRect()
   if (!bounds) return { x: 0, y: 0 }
   return {
     x: clampCoordinate(((clientX - bounds.left) / bounds.width) * 100),
@@ -722,8 +938,9 @@ function startCircle(event: PointerEvent) {
 }
 
 function resizeCircle(event: PointerEvent) {
-  if (!circleStart.value || !diagramStage.value) return
-  const bounds = diagramStage.value.getBoundingClientRect()
+  const stage = diagramImageFrame.value ?? diagramStage.value
+  if (!circleStart.value || !stage) return
+  const bounds = stage.getBoundingClientRect()
   const centerX = (circleStart.value.x / 100) * bounds.width
   const centerY = (circleStart.value.y / 100) * bounds.height
   const distance = Math.hypot(event.clientX - bounds.left - centerX, event.clientY - bounds.top - centerY)
@@ -770,13 +987,21 @@ function startLabelDrag(event: PointerEvent, structure: Structure) {
 function moveLabel(event: PointerEvent) {
   const structure = activeDiagram.value?.structures.find((item) => item.id === draggingLabelId.value)
   const stage = diagramStage.value
-  if (!structure || !stage) return
-  const bounds = stage.getBoundingClientRect()
+  const frame = diagramImageFrame.value
+  if (!structure || !stage || !frame) return
+  const stageBounds = stage.getBoundingClientRect()
+  const frameBounds = frame.getBoundingClientRect()
   const label = event.currentTarget as HTMLElement
-  const halfWidth = (label.offsetWidth / bounds.width) * 50
-  const halfHeight = (label.offsetHeight / bounds.height) * 50
-  structure.labelX = Math.max(halfWidth, Math.min(100 - halfWidth, ((event.clientX - bounds.left) / bounds.width) * 100))
-  structure.labelY = Math.max(halfHeight, Math.min(100 - halfHeight, ((event.clientY - bounds.top) / bounds.height) * 100))
+  const halfWidthInFrame = (label.offsetWidth / frameBounds.width) * 50
+  const halfHeightInFrame = (label.offsetHeight / frameBounds.height) * 50
+  const pointerXInFrame = ((event.clientX - frameBounds.left) / frameBounds.width) * 100
+  const pointerYInFrame = ((event.clientY - frameBounds.top) / frameBounds.height) * 100
+  const minX = ((stageBounds.left - frameBounds.left) / frameBounds.width) * 100 + halfWidthInFrame
+  const maxX = ((stageBounds.right - frameBounds.left) / frameBounds.width) * 100 - halfWidthInFrame
+  const minY = ((stageBounds.top - frameBounds.top) / frameBounds.height) * 100 + halfHeightInFrame
+  const maxY = ((stageBounds.bottom - frameBounds.top) / frameBounds.height) * 100 - halfHeightInFrame
+  structure.labelX = Math.max(minX, Math.min(maxX, pointerXInFrame))
+  structure.labelY = Math.max(minY, Math.min(maxY, pointerYInFrame))
 }
 
 function endLabelDrag() {
@@ -854,7 +1079,8 @@ async function importLocalDiagrams() {
       const imageBlob = await (await fetch(localDiagram.image)).blob()
       const extension = imageBlob.type.split('/')[1] || 'png'
       const imageFile = new File([imageBlob], `${localDiagram.title || 'diagram'}.${extension}`, { type: imageBlob.type || 'image/png' })
-      const imagePath = await uploadImage(imageFile, localDiagram.id)
+      const optimizedFile = await optimizeImage(imageFile, 2400)
+      const imagePath = await uploadImage(optimizedFile, localDiagram.id)
       const folderId = await getOrCreateFolderId(localDiagram.folderName ?? '')
       const { error: diagramError } = await supabase.from('diagrams').insert({
         id: localDiagram.id,
@@ -933,7 +1159,7 @@ function onDrop(event: DragEvent) {
           <span class="brand-mark" aria-hidden="true">
             <svg viewBox="0 0 36 36" fill="none"><path d="M18 4.5v27M4.5 18h27M8.45 8.45l19.1 19.1m0-19.1-19.1 19.1" stroke="currentColor" stroke-width="1.6"/><circle cx="18" cy="18" r="5.25" stroke="currentColor" stroke-width="1.6"/></svg>
           </span>
-          <span class="brand-name">FIELDNOTES<span>ANATOMY STUDY</span></span>
+          <span class="brand-name">ANATOMY TOGETHER<span>SHARED STUDY SPACE</span></span>
         </a>
         <template v-if="!isSupabaseConfigured">
           <div class="eyebrow"><span class="eyebrow-line"></span> CLOUD LIBRARY SETUP</div>
@@ -948,24 +1174,25 @@ function onDrop(event: DragEvent) {
         </template>
         <template v-else>
           <div class="eyebrow"><span class="eyebrow-line"></span> YOUR PRIVATE STUDY LIBRARY</div>
-          <h1>{{ authMode === 'signin' ? 'Welcome back.' : 'Make it yours.' }}<br /><em>{{ authMode === 'signin' ? 'Pick up where you left off.' : 'Create your account.' }}</em></h1>
+          <h1>{{ authMode === 'signin' ? 'Welcome back.' : authMode === 'signup' ? 'Make it yours.' : 'Reset access.' }}<br /><em>{{ authMode === 'signin' ? 'Pick up where you left off.' : authMode === 'signup' ? 'Create your account.' : 'Recover your password.' }}</em></h1>
           <p class="auth-description">Your diagrams and labels sync securely to your account.</p>
           <form class="auth-form" @submit.prevent="handleAuth">
             <label for="auth-email">EMAIL ADDRESS</label>
             <input id="auth-email" v-model="authEmail" type="email" autocomplete="email" required placeholder="you@example.com" />
-            <label for="auth-password">PASSWORD</label>
-            <input id="auth-password" v-model="authPassword" :autocomplete="authMode === 'signin' ? 'current-password' : 'new-password'" type="password" minlength="8" required placeholder="At least 8 characters" />
+            <label v-if="authMode !== 'reset'" for="auth-password">PASSWORD</label>
+            <input v-if="authMode !== 'reset'" id="auth-password" v-model="authPassword" :autocomplete="authMode === 'signin' ? 'current-password' : 'new-password'" type="password" minlength="8" required placeholder="At least 8 characters" />
             <p v-if="authMessage" class="auth-message">{{ authMessage }}</p>
             <p v-if="appError" class="auth-error">{{ appError }}</p>
-            <button class="primary-button auth-submit" type="submit" :disabled="authBusy">{{ authBusy ? 'Please wait…' : authMode === 'signin' ? 'Sign in' : 'Create account' }}</button>
+            <button class="primary-button auth-submit" type="submit" :disabled="authBusy">{{ authBusy ? 'Please wait…' : authMode === 'signin' ? 'Sign in' : authMode === 'signup' ? 'Create account' : 'Send reset link' }}</button>
           </form>
-          <button class="auth-switch" type="button" @click="authMode = authMode === 'signin' ? 'signup' : 'signin'; authMessage = ''; appError = ''">
-            {{ authMode === 'signin' ? 'New to Fieldnotes? Create an account' : 'Already have an account? Sign in' }}
+          <button v-if="authMode === 'signin'" class="auth-switch" type="button" @click="authMode = 'reset'; authMessage = ''; appError = ''; authPassword = ''">Forgot your password?</button>
+          <button class="auth-switch" type="button" @click="authMode = authMode === 'signup' ? 'signin' : authMode === 'reset' ? 'signin' : 'signup'; authMessage = ''; appError = ''; authPassword = ''">
+            {{ authMode === 'signup' ? 'Already have an account? Sign in' : authMode === 'reset' ? 'Back to sign in' : 'New to Anatomy Together? Create an account' }}
           </button>
         </template>
       </section>
       <div class="auth-illustration" aria-hidden="true">
-        <div class="art-topline"><span>FIELDNOTES / VOL. 01</span><span>STUDY PLATE</span></div>
+        <div class="art-topline"><span>ANATOMY TOGETHER / VOL. 01</span><span>STUDY PLATE</span></div>
         <div class="auth-plate">
           <svg class="anatomy-sketch" viewBox="0 0 320 390" fill="none">
             <path d="M132 39c-9 6-14 20-13 38l4 32-20 19c-18 17-29 42-33 73l-10 82 19 3 17-71 9-32 5 54-6 107h27l12-97 7-54 7 54 12 97h27l-6-107 5-54 9 32 17 71 19-3-10-82c-4-31-15-56-33-73l-20-19 4-32c1-18-4-32-13-38-6 12-14 19-20 19s-14-7-20-19Z" stroke="currentColor" stroke-width="1.35"/>
@@ -975,7 +1202,7 @@ function onDrop(event: DragEvent) {
           </svg>
           <span class="auth-plate-label">ANTERIOR / FIG. 01</span>
         </div>
-        <div class="art-bottomline"><span>OBSERVE · LABEL · RECALL</span><span>FIELDNOTES</span></div>
+        <div class="art-bottomline"><span>OBSERVE · LABEL · RECALL</span><span>ANATOMY TOGETHER</span></div>
       </div>
     </main>
 
@@ -985,7 +1212,7 @@ function onDrop(event: DragEvent) {
         <span class="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 36 36" fill="none"><path d="M18 4.5v27M4.5 18h27M8.45 8.45l19.1 19.1m0-19.1-19.1 19.1" stroke="currentColor" stroke-width="1.6"/><circle cx="18" cy="18" r="5.25" stroke="currentColor" stroke-width="1.6"/></svg>
         </span>
-        <span class="brand-name">FIELDNOTES<span>ANATOMY STUDY</span></span>
+        <span class="brand-name">ANATOMY TOGETHER<span>SHARED STUDY SPACE</span></span>
       </a>
 
       <button class="new-button" type="button" :disabled="uploadBusy" @click="openUpload">
@@ -1203,10 +1430,14 @@ function onDrop(event: DragEvent) {
               <div class="canvas-caption"><span class="caption-icon">⌗</span><span>{{ mode === 'study' ? 'IDENTIFY THE CALLOUTS' : 'DIAGRAM CANVAS' }}</span></div>
               <div class="canvas-actions">
                 <span v-if="mode === 'edit'" class="image-dimensions">{{ activeDiagram.structures.length }} {{ activeDiagram.structures.length === 1 ? 'callout' : 'callouts' }}</span>
-                <label v-if="mode === 'edit' && canEditActive" class="image-scale-control" title="Adjust image size">
-                  <span>SIZE {{ activeDiagram.imageScale }}%</span>
-                  <input v-model.number="activeDiagram.imageScale" type="range" min="50" max="200" step="5" aria-label="Image size" />
-                </label>
+                <div v-if="mode === 'edit' && canEditActive" class="image-scale-control" aria-label="Diagram zoom controls">
+                  <button class="fit-button" :class="{ active: activeDiagram.imageScale === 100 }" type="button" :aria-pressed="activeDiagram.imageScale === 100" @click="fitDiagram">Fit</button>
+                  <div class="zoom-control">
+                    <button type="button" aria-label="Zoom out" title="Zoom out" :disabled="activeDiagram.imageScale <= 50" @click="adjustDiagramZoom(-25)">−</button>
+                    <span>{{ activeDiagram.imageScale }}%</span>
+                    <button type="button" aria-label="Zoom in" title="Zoom in" :disabled="activeDiagram.imageScale >= 200" @click="adjustDiagramZoom(25)">＋</button>
+                  </div>
+                </div>
                 <button v-if="mode === 'edit' && canEditActive" class="icon-button" title="Replace diagram image" aria-label="Replace diagram image" type="button" :disabled="uploadBusy" @click="replaceImage">
                   <svg viewBox="0 0 20 20" fill="none"><path d="M10 13V3m0 0L6.5 6.5M10 3l3.5 3.5M4 11.5v4h12v-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 </button>
@@ -1215,7 +1446,7 @@ function onDrop(event: DragEvent) {
             <div
               class="diagram-stage"
               ref="diagramStage"
-              :style="{ width: `${activeDiagram.imageScale}%` }"
+              :style="{ width: `${diagramCanvasWidth}px` }"
               :class="{ placing, 'placing-circle': placing && labelTargetType === 'circle' }"
               @click="onDiagramClick"
               @pointerdown="startCircle"
@@ -1225,8 +1456,9 @@ function onDrop(event: DragEvent) {
               @dragover.prevent
               @drop.prevent="onDrop"
             >
-              <img class="diagram-image" :src="activeDiagram.image" :alt="activeDiagram.title" draggable="false" />
-              <svg class="leader-lines" aria-hidden="true">
+              <div ref="diagramImageFrame" class="diagram-image-frame" :style="{ width: `${diagramDisplayWidth}px`, height: `${diagramDisplayHeight}px` }">
+                <img class="diagram-image" :src="activeDiagram.image" :alt="activeDiagram.title" draggable="false" @load="onDiagramImageLoad" />
+                <svg class="leader-lines" aria-hidden="true">
                 <line
                   v-for="(structure, index) in activeDiagram.structures"
                   :key="`line-${structure.id}`"
@@ -1286,14 +1518,14 @@ function onDrop(event: DragEvent) {
                 :style="{ left: `${circleDraft.x}%`, top: `${circleDraft.y}%`, width: `${circleDraft.radius * 2}%` }"
                 aria-hidden="true"
               ></div>
-              <div v-if="placing" class="placement-hint"><span>＋</span> {{ labelTargetType === 'point' ? 'Click a point to place the label' : 'Drag out a circle target' }}</div>
-              <div v-if="!activeDiagram.structures.length && !placing" class="canvas-empty-tip">
-                <span class="tip-cross">＋</span><span>Start with a label</span>
+                <div v-if="placing" class="placement-hint"><span>＋</span> {{ labelTargetType === 'point' ? 'Click a point to place the label' : 'Drag out a circle target' }}</div>
+                <div v-if="!activeDiagram.structures.length && !placing" class="canvas-empty-tip">
+                  <span class="tip-cross">＋</span><span>Start with a label</span>
+                </div>
               </div>
             </div>
             <div class="canvas-footer">
-              <span><span class="footer-dot"></span> {{ mode === 'study' ? 'Labels hidden for practice' : 'Changes save automatically' }}</span>
-              <span>IMAGE STUDY SHEET</span>
+              <span v-if="mode === 'study'"> <span class="footer-dot"></span> Labels hidden for practice</span>
             </div>
           </div>
 
@@ -1387,14 +1619,36 @@ function onDrop(event: DragEvent) {
             <span class="art-label label-one"><b>01</b> thoracic cavity</span>
             <span class="art-label label-two"><b>02</b> sternum</span>
             <span class="art-label label-three"><b>03</b> diaphragm</span>
-            <span class="art-seal">F<br />N</span>
+            <span class="art-seal">A<br />T</span>
           </div>
-          <div class="art-bottomline"><span>ANTERIOR VIEW</span><span>FIELDNOTES / ANATOMY</span></div>
+          <div class="art-bottomline"><span>ANTERIOR VIEW</span><span>ANATOMY TOGETHER</span></div>
         </div>
       </section>
     </main>
 
     <input ref="imageInput" class="visually-hidden" type="file" accept="image/*" :multiple="!replacingImage" @change="handleFile" />
+
+    <div v-if="imageResizeOpen" class="modal-scrim" @click.self="closeImageResize">
+      <form class="image-modal" @submit.prevent="confirmImageResize">
+        <div class="modal-kicker">IMAGE SETUP <span>{{ optimizedImageCount }} {{ optimizedImageCount === 1 ? 'IMAGE' : 'IMAGES' }}</span></div>
+        <h2>Resize before upload</h2>
+        <p>Images are converted to WebP and scaled to the size you choose.</p>
+        <div class="image-preview-frame"><img :src="imagePreviewUrl" :alt="imagePreviewName" /></div>
+        <div class="resize-summary">
+          <span>{{ imagePreviewName }}</span>
+          <strong>{{ previewResizeDimensions().width }} × {{ previewResizeDimensions().height }} px</strong>
+        </div>
+        <label class="modal-label" for="image-max-edge">MAXIMUM SIDE</label>
+        <div class="resize-control">
+          <input id="image-max-edge" v-model.number="resizeMaxEdge" type="range" min="1200" max="4000" step="200" />
+          <span>{{ resizeMaxEdge }} px</span>
+        </div>
+        <div class="modal-actions">
+          <button class="text-button" type="button" @click="closeImageResize">Cancel</button>
+          <button class="primary-button" type="submit" :disabled="uploadBusy">Use this size</button>
+        </div>
+      </form>
+    </div>
 
     <div v-if="uploadFolderOpen" class="modal-scrim" @click.self="uploadFolderOpen = false">
       <form class="name-modal" @submit.prevent="beginBatchUpload">
@@ -1620,13 +1874,21 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .canvas-actions { display: flex; align-items: center; gap: 10px; }
 .image-dimensions { color: #a0a49b; font-family: var(--mono); font-size: 9px; }
 .image-scale-control { display: flex; align-items: center; gap: 6px; color: #899287; font-family: var(--mono); font-size: 8px; letter-spacing: .05em; white-space: nowrap; }
-.image-scale-control input { width: 74px; height: 3px; accent-color: #5d8062; cursor: pointer; }
+.fit-button { height: 29px; padding: 0 8px; border: 1px solid #e1e4dc; border-radius: 3px; background: transparent; color: #727b70; font-family: var(--mono); font-size: 8px; cursor: pointer; }
+.fit-button:hover, .fit-button.active { border-color: #aebcae; background: #edf2ea; color: #4f7053; }
+.zoom-control { display: grid; grid-template-columns: 29px 52px 29px; height: 29px; align-items: center; border: 1px solid #e1e4dc; border-radius: 3px; background: #fff; }
+.zoom-control button { height: 27px; padding: 0; border: 0; background: transparent; color: #617263; font-family: var(--mono); font-size: 13px; cursor: pointer; }
+.zoom-control button:first-child { border-right: 1px solid #edf0e9; }
+.zoom-control button:last-child { border-left: 1px solid #edf0e9; }
+.zoom-control button:disabled { color: #bdc3ba; cursor: not-allowed; }
+.zoom-control span { text-align: center; font-family: var(--mono); font-size: 8px; }
 .icon-button, .add-icon { display: grid; width: 29px; height: 29px; place-items: center; border: 1px solid #e1e4dc; border-radius: 4px; background: transparent; color: #727b70; cursor: pointer; }
 .icon-button:hover, .add-icon:hover { border-color: #aebcae; background: #f2f5ef; }
 .icon-button svg, .add-icon svg { width: 16px; height: 16px; }
-.diagram-stage { position: relative; width: 100%; margin: 17px auto 13px; cursor: default; }
+.diagram-stage { position: relative; width: 100%; margin: 17px auto 13px; padding: 32px; box-sizing: border-box; cursor: default; background: repeating-linear-gradient(0deg, transparent, transparent 23px, #edf0e827 24px), repeating-linear-gradient(90deg, transparent, transparent 23px, #edf0e827 24px); }
 .diagram-stage.placing { cursor: crosshair; }
-.diagram-image { display: block; width: 100%; height: auto; user-select: none; }
+.diagram-image-frame { position: relative; width: 100%; margin: 0 auto; }
+.diagram-image { display: block; width: 100%; height: 100%; object-fit: contain; user-select: none; }
 .leader-lines { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .leader-lines line { stroke: #527658; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .callout-target { position: absolute; width: 1px; height: 1px; pointer-events: none; }
@@ -1734,6 +1996,17 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .modal-input { width: 100%; height: 40px; padding: 0 10px; border: 1px solid #dce2d9; border-radius: 3px; background: #fff; color: #39433b; font-size: 12px; }
 .modal-input::placeholder { color: #acb2a8; }
 .modal-actions { display: flex; justify-content: end; align-items: center; gap: 17px; margin-top: 20px; }
+.image-modal { width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 40px); overflow-y: auto; padding: 26px; border: 1px solid #e0e4da; border-radius: 5px; background: #fbfbf8; box-shadow: 0 16px 50px #14211935; animation: rise-in .2s both; }
+.image-modal h2 { margin: 13px 0 5px; color: #303a32; font-family: var(--serif); font-size: 27px; font-weight: 400; }
+.image-modal p { margin: 0 0 16px; color: #858b82; font-size: 11px; line-height: 1.55; }
+.image-preview-frame { height: 280px; display: grid; place-items: center; overflow: hidden; border: 1px solid #e4e7df; background: #f1f3ed; }
+.image-preview-frame img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.resize-summary { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; color: #737c71; font-size: 11px; }
+.resize-summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resize-summary strong { flex: 0 0 auto; font-family: var(--mono); font-size: 10px; }
+.resize-control { display: grid; grid-template-columns: minmax(0, 1fr) 64px; align-items: center; gap: 12px; }
+.resize-control input { width: 100%; accent-color: #5d8062; }
+.resize-control span { color: #687568; font-family: var(--mono); font-size: 10px; }
 .auth-screen { display: grid; width: 100%; min-height: 100vh; grid-template-columns: minmax(370px, .92fr) minmax(400px, 1.08fr); align-items: center; gap: clamp(40px, 9vw, 140px); padding: 48px clamp(32px, 9vw, 140px); background: #f5f5f0; }
 .auth-card { width: min(100%, 460px); justify-self: end; padding-bottom: 8px; animation: rise-in .55s both; }
 .auth-brand { margin: 0 0 54px; }

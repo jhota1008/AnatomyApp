@@ -150,8 +150,14 @@ create policy "Users can delete structures on own diagrams"
     )
   );
 
-insert into storage.buckets (id, name, public)
-values ('anatomy-diagrams', 'anatomy-diagrams', false)
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'anatomy-diagrams',
+  'anatomy-diagrams',
+  false,
+  26214400,
+  array['image/webp']::text[]
+)
 on conflict (id) do nothing;
 
 create policy "Users can read own and public diagram images"
