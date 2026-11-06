@@ -65,6 +65,8 @@ const newFolderOpen = ref(false)
 const newFolderName = ref('')
 const newFolderNameInput = ref<HTMLInputElement | null>(null)
 const folderBusy = ref(false)
+const uploadFolderOpen = ref(false)
+const uploadFolderId = ref('')
 const tagFilter = ref('')
 const tagDraft = ref('')
 const shareMessage = ref('')
@@ -336,6 +338,12 @@ async function signOut() {
 function openUpload() {
   replacingImage.value = false
   if (imageInput.value) imageInput.value.multiple = true
+  uploadFolderId.value = folderFilter.value || ''
+  uploadFolderOpen.value = true
+}
+
+function beginBatchUpload() {
+  uploadFolderOpen.value = false
   imageInput.value?.click()
 }
 
@@ -413,7 +421,7 @@ async function handleFile(event: Event) {
           title,
           image_path: imagePath,
           image_scale: 100,
-          folder_id: null,
+          folder_id: uploadFolderId.value || null,
           tags: [],
           visibility: 'private',
         })
@@ -433,8 +441,8 @@ async function handleFile(event: Event) {
           image: signedImage.signedUrl,
           imagePath,
           imageScale: 100,
-          folderId: null,
-          folderName: '',
+          folderId: uploadFolderId.value || null,
+          folderName: folders.value.find((folder) => folder.id === uploadFolderId.value)?.name ?? '',
           tags: [],
           visibility: 'private',
           structures: [],
@@ -450,6 +458,7 @@ async function handleFile(event: Event) {
       diagrams.value.unshift(...created)
       selectedId.value = created[0]?.id ?? selectedId.value
       libraryView.value = 'mine'
+      folderFilter.value = uploadFolderId.value || ''
       mode.value = 'edit'
       resetStudy()
       saveState.value = 'saved'
@@ -902,12 +911,15 @@ function getErrorMessage(error: unknown) {
 }
 
 function onDrop(event: DragEvent) {
-  const file = event.dataTransfer?.files[0]
-  if (!file || !file.type.startsWith('image/')) return
+  const files = Array.from(event.dataTransfer?.files ?? []).filter((file) => file.type.startsWith('image/'))
+  if (!files.length) return
   const input = imageInput.value
   if (!input) return
+  replacingImage.value = false
+  uploadFolderId.value = folderFilter.value || ''
+  if (input) input.multiple = true
   const transfer = new DataTransfer()
-  transfer.items.add(file)
+  files.forEach((file) => transfer.items.add(file))
   input.files = transfer.files
   input.dispatchEvent(new Event('change', { bubbles: true }))
 }
@@ -1384,6 +1396,22 @@ function onDrop(event: DragEvent) {
 
     <input ref="imageInput" class="visually-hidden" type="file" accept="image/*" :multiple="!replacingImage" @change="handleFile" />
 
+    <div v-if="uploadFolderOpen" class="modal-scrim" @click.self="uploadFolderOpen = false">
+      <form class="name-modal" @submit.prevent="beginBatchUpload">
+        <div class="modal-kicker">NEW DIAGRAMS <span>{{ availableFolders.length }} FOLDERS</span></div>
+        <h2>Add to a folder</h2>
+        <p>Select where every image in this batch should be stored. You can change folders later for each diagram.</p>
+        <label class="modal-label" for="upload-folder-select">FOLDER</label>
+        <select id="upload-folder-select" v-model="uploadFolderId" class="modal-input">
+          <option value="">Unfiled</option>
+          <option v-for="folder in availableFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option>
+        </select>
+        <div class="modal-actions">
+          <button class="text-button" type="button" @click="uploadFolderOpen = false">Cancel</button>
+          <button class="primary-button" type="submit">Choose images</button>
+        </div>
+      </form>
+    </div>
     <div v-if="pendingPoint" class="modal-scrim" @click.self="pendingPoint = null">
       <form class="name-modal" @submit.prevent="addStructure">
         <div class="modal-kicker">NEW CALLOUT <span>{{ String((activeDiagram?.structures.length ?? 0) + 1).padStart(2, '0') }}</span></div>
