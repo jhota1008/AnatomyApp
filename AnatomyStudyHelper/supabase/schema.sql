@@ -30,6 +30,7 @@ create table public.structures (
   label_y double precision check (label_y is null or (label_y >= 0 and label_y <= 100)),
   target_type text not null default 'point' check (target_type in ('point', 'circle')),
   radius double precision check (radius is null or (radius > 0 and radius <= 25)),
+  extra_anchors jsonb not null default '[]'::jsonb check (jsonb_typeof(extra_anchors) = 'array'),
   position integer not null default 0
 );
 

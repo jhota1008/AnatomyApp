@@ -3,6 +3,14 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
 
+type Anchor = {
+  id: string
+  x: number
+  y: number
+  targetType: 'point' | 'circle'
+  radius: number | null
+}
+
 type Structure = {
   id: string
   name: string
@@ -12,6 +20,7 @@ type Structure = {
   labelY?: number | null
   targetType?: 'point' | 'circle'
   radius?: number | null
+  anchors?: Anchor[]
 }
 
 type Diagram = {
@@ -85,6 +94,7 @@ const pendingPoint = ref<{
   radius: number | null
 } | null>(null)
 const labelTargetType = ref<'point' | 'circle'>('point')
+const anchoringStructureId = ref<string | null>(null)
 const circleStart = ref<{ x: number; y: number } | null>(null)
 const circleDraft = ref<{ x: number; y: number; radius: number } | null>(null)
 const structureName = ref('')
@@ -274,7 +284,7 @@ async function loadCloudDiagrams() {
 
     const { data, error } = await supabase
       .from('diagrams')
-      .select('id, user_id, title, image_path, image_scale, folder_id, updated_at, tags, visibility, structures(id, name, x, y, label_x, label_y, target_type, radius, position)')
+      .select('id, user_id, title, image_path, image_scale, folder_id, updated_at, tags, visibility, structures(id, name, x, y, label_x, label_y, target_type, radius, extra_anchors, position)')
       .or(`user_id.eq.${user.value.id},visibility.eq.public`)
       .order('updated_at', { ascending: false })
     if (error) throw error
@@ -299,7 +309,7 @@ async function loadCloudDiagrams() {
         updatedAt: new Date(row.updated_at).getTime(),
         structures: [...(row.structures ?? [])]
           .sort((first, second) => first.position - second.position)
-          .map(({ id, name, x, y, label_x, label_y, target_type, radius }) => ({
+          .map(({ id, name, x, y, label_x, label_y, target_type, radius, extra_anchors }) => ({
             id,
             name,
             x,
@@ -308,6 +318,7 @@ async function loadCloudDiagrams() {
             labelY: label_y,
             targetType: target_type ?? 'point',
             radius,
+            anchors: (extra_anchors ?? []) as Anchor[],
           })),
       })
     }
@@ -717,6 +728,7 @@ async function persistDiagram(diagram: Diagram) {
           label_y: getLabelPosition(structure).y,
           target_type: structure.targetType ?? 'point',
           radius: structure.targetType === 'circle' ? structure.radius : null,
+          extra_anchors: structure.anchors ?? [],
           diagram_id: diagram.id,
           position,
         })),
@@ -898,6 +910,10 @@ async function onDiagramClick(event: MouseEvent) {
   const bounds = stage.getBoundingClientRect()
   const x = clampCoordinate(((event.clientX - bounds.left) / bounds.width) * 100)
   const y = clampCoordinate(((event.clientY - bounds.top) / bounds.height) * 100)
+  if (anchoringStructureId.value) {
+    addAnchor({ x, y, targetType: 'point', radius: null })
+    return
+  }
   pendingPoint.value = {
     x,
     y,
@@ -954,6 +970,12 @@ async function finishCircle(event: PointerEvent) {
   resizeCircle(event)
   const draft = circleDraft.value
   const radius = Math.max(0.25, draft.radius)
+  if (anchoringStructureId.value) {
+    circleStart.value = null
+    circleDraft.value = null
+    addAnchor({ x: draft.x, y: draft.y, targetType: 'circle', radius })
+    return
+  }
   const labelX = clampCoordinate(draft.x + (draft.x > 76 ? -(radius + 3) : radius + 3))
   pendingPoint.value = {
     x: draft.x,
@@ -1011,6 +1033,37 @@ function endLabelDrag() {
 function cancelCircle() {
   circleStart.value = null
   circleDraft.value = null
+}
+
+// The label's own point or circle is the first anchor; extras follow it.
+function getAnchors(structure: Structure): Anchor[] {
+  return [
+    { id: structure.id, x: structure.x, y: structure.y, targetType: structure.targetType ?? 'point', radius: structure.radius ?? null },
+    ...(structure.anchors ?? []),
+  ]
+}
+
+function toggleAnchoring(structure: Structure) {
+  const stopping = anchoringStructureId.value === structure.id
+  anchoringStructureId.value = stopping ? null : structure.id
+  placing.value = !stopping
+  pendingPoint.value = null
+  cancelCircle()
+}
+
+function addAnchor(anchor: Omit<Anchor, 'id'>) {
+  const structure = activeDiagram.value?.structures.find((item) => item.id === anchoringStructureId.value)
+  if (!structure || !activeDiagram.value || !canEditActive.value) return
+  structure.anchors = [...(structure.anchors ?? []), { id: crypto.randomUUID(), ...anchor }]
+  activeDiagram.value.updatedAt = Date.now()
+  anchoringStructureId.value = null
+  placing.value = false
+}
+
+function removeAnchor(structure: Structure, anchorId: string) {
+  if (!activeDiagram.value || !canEditActive.value) return
+  structure.anchors = (structure.anchors ?? []).filter((anchor) => anchor.id !== anchorId)
+  activeDiagram.value.updatedAt = Date.now()
 }
 
 function addStructure() {
@@ -1107,6 +1160,7 @@ async function importLocalDiagrams() {
             label_y: getLabelPosition(structure).y,
             target_type: structure.targetType ?? 'point',
             radius: structure.targetType === 'circle' ? structure.radius : null,
+            extra_anchors: structure.anchors ?? [],
             diagram_id: localDiagram.id,
             position,
           })),
@@ -1306,18 +1360,22 @@ function onDrop(event: DragEvent) {
               <img :src="currentQuizQuestion.image" :alt="currentQuizQuestion.diagramTitle" draggable="false" />
               <svg class="quiz-leader-lines" aria-hidden="true">
                 <line
-                  :x1="`${currentQuizQuestion.structure.x}%`"
-                  :y1="`${currentQuizQuestion.structure.y}%`"
+                  v-for="anchor in getAnchors(currentQuizQuestion.structure)"
+                  :key="`quiz-line-${anchor.id}`"
+                  :x1="`${anchor.x}%`"
+                  :y1="`${anchor.y}%`"
                   :x2="`${getLabelPosition(currentQuizQuestion.structure).x}%`"
                   :y2="`${getLabelPosition(currentQuizQuestion.structure).y}%`"
                 />
               </svg>
-              <div
-                v-if="currentQuizQuestion.structure.targetType === 'circle'"
-                class="quiz-target-circle"
-                :style="{ left: `${currentQuizQuestion.structure.x}%`, top: `${currentQuizQuestion.structure.y}%`, width: `${(currentQuizQuestion.structure.radius ?? 2) * 2}%` }"
-              ></div>
-              <span v-else class="quiz-target-dot" :style="{ left: `${currentQuizQuestion.structure.x}%`, top: `${currentQuizQuestion.structure.y}%` }"></span>
+              <template v-for="anchor in getAnchors(currentQuizQuestion.structure)" :key="`quiz-target-${anchor.id}`">
+                <div
+                  v-if="anchor.targetType === 'circle'"
+                  class="quiz-target-circle"
+                  :style="{ left: `${anchor.x}%`, top: `${anchor.y}%`, width: `${(anchor.radius ?? 2) * 2}%` }"
+                ></div>
+                <span v-else class="quiz-target-dot" :style="{ left: `${anchor.x}%`, top: `${anchor.y}%` }"></span>
+              </template>
               <span
                 class="quiz-callout-number"
                 :style="{ left: `${getLabelPosition(currentQuizQuestion.structure).x}%`, top: `${getLabelPosition(currentQuizQuestion.structure).y}%` }"
@@ -1459,25 +1517,29 @@ function onDrop(event: DragEvent) {
               <div ref="diagramImageFrame" class="diagram-image-frame" :style="{ width: `${diagramDisplayWidth}px`, height: `${diagramDisplayHeight}px` }">
                 <img class="diagram-image" :src="activeDiagram.image" :alt="activeDiagram.title" draggable="false" @load="onDiagramImageLoad" />
                 <svg class="leader-lines" aria-hidden="true">
-                <line
-                  v-for="(structure, index) in activeDiagram.structures"
-                  :key="`line-${structure.id}`"
-                  :x1="`${structure.x}%`"
-                  :y1="`${structure.y}%`"
-                  :x2="`${getLabelPosition(structure).x}%`"
-                  :y2="`${getLabelPosition(structure).y}%`"
-                />
-              </svg>
-              <template v-for="(structure, index) in activeDiagram.structures" :key="`target-${structure.id}`">
-                <div
-                  v-if="structure.targetType === 'circle'"
-                  class="target-circle"
-                  :style="{ left: `${structure.x}%`, top: `${structure.y}%`, width: `${(structure.radius ?? 2) * 2}%` }"
-                  aria-hidden="true"
-                ></div>
-                <div v-else class="callout-target" :style="{ left: `${structure.x}%`, top: `${structure.y}%` }" aria-hidden="true">
-                  <span class="target-dot"></span>
-                </div>
+                  <template v-for="structure in activeDiagram.structures" :key="`line-${structure.id}`">
+                    <line
+                      v-for="anchor in getAnchors(structure)"
+                      :key="`line-${anchor.id}`"
+                      :x1="`${anchor.x}%`"
+                      :y1="`${anchor.y}%`"
+                      :x2="`${getLabelPosition(structure).x}%`"
+                      :y2="`${getLabelPosition(structure).y}%`"
+                    />
+                  </template>
+                </svg>
+              <template v-for="structure in activeDiagram.structures" :key="`target-${structure.id}`">
+                <template v-for="anchor in getAnchors(structure)" :key="`target-${anchor.id}`">
+                  <div
+                    v-if="anchor.targetType === 'circle'"
+                    class="target-circle"
+                    :style="{ left: `${anchor.x}%`, top: `${anchor.y}%`, width: `${(anchor.radius ?? 2) * 2}%` }"
+                    aria-hidden="true"
+                  ></div>
+                  <div v-else class="callout-target" :style="{ left: `${anchor.x}%`, top: `${anchor.y}%` }" aria-hidden="true">
+                    <span class="target-dot"></span>
+                  </div>
+                </template>
               </template>
               <template v-for="(structure, index) in activeDiagram.structures" :key="`label-${structure.id}`">
                 <button
@@ -1540,11 +1602,11 @@ function onDrop(event: DragEvent) {
               :class="{ active: placing }"
               :aria-pressed="placing"
               type="button"
-              @click="placing = !placing; pendingPoint = null"
+              @click="placing = !placing; pendingPoint = null; anchoringStructureId = null"
             >
               <span>{{ placing ? '✓' : '＋' }}</span> {{ placing ? 'Done adding' : 'Add label' }}
             </button>
-            <div v-if="mode === 'edit' && placing" class="placing-note"><span class="pulse-dot"></span> Choose a target type, then mark the diagram</div>
+            <div v-if="mode === 'edit' && placing" class="placing-note"><span class="pulse-dot"></span> {{ anchoringStructureId ? 'Mark another spot for this label' : 'Choose a target type, then mark the diagram' }}</div>
             <div v-if="mode === 'edit' && placing" class="target-type-picker" role="group" aria-label="Label target type">
               <button class="target-type-button" :class="{ selected: labelTargetType === 'point' }" type="button" :aria-pressed="labelTargetType === 'point'" @click="labelTargetType = 'point'; cancelCircle()">
                 <span class="point-symbol"></span> Point
@@ -1568,6 +1630,10 @@ function onDrop(event: DragEvent) {
                 <div v-if="mode === 'edit' && canEditActive" class="structure-name-wrap">
                   <input :value="structure.name" class="structure-name" :aria-label="`Label ${index + 1} name`" placeholder="Name this label" @input="setStructureName(structure, ($event.target as HTMLInputElement).value)" />
                   <button class="remove-button" :aria-label="`Remove ${structure.name || 'label'}`" title="Remove label" type="button" @click="removeStructure(structure.id)">×</button>
+                  <div class="anchor-row">
+                    <button class="anchor-add-button" :class="{ active: anchoringStructureId === structure.id }" type="button" @click="toggleAnchoring(structure)">{{ anchoringStructureId === structure.id ? 'Cancel' : '＋ Add spot' }}</button>
+                    <span v-for="(anchor, anchorIndex) in structure.anchors ?? []" :key="anchor.id" class="anchor-chip">Spot {{ anchorIndex + 2 }}<button type="button" :aria-label="`Remove spot ${anchorIndex + 2} from ${structure.name || 'label'}`" @click="removeAnchor(structure, anchor.id)">×</button></span>
+                  </div>
                 </div>
                 <span v-else-if="mode === 'edit'" class="public-label-name">{{ structure.name }}</span>
                 <div v-else class="answer-wrap">
@@ -1934,6 +2000,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .structure-name { width: 100%; padding: 7px 0; border: 0; background: transparent; color: #39413a; font-size: 11px; }
 .public-label-name { min-width: 0; overflow-wrap: anywhere; color: #536254; font-size: 11px; }
 .structure-name::placeholder { color: #a6aaa2; }
+.anchor-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding-bottom: 7px; }
+.anchor-add-button { min-height: 20px; padding: 0 7px; border: 1px dashed #cbd5c8; border-radius: 3px; background: transparent; color: #5e795f; font-size: 9px; cursor: pointer; }
+.anchor-add-button:hover, .anchor-add-button.active { border-color: #88a088; background: #eef4ec; }
+.anchor-chip { display: inline-flex; align-items: center; gap: 3px; min-height: 20px; padding: 0 3px 0 7px; border: 1px solid #dce5d9; border-radius: 3px; background: #f1f5ee; color: #587259; font-size: 9px; }
+.anchor-chip button { width: 14px; height: 14px; padding: 0; border: 0; background: transparent; color: #7c8d78; font-size: 12px; line-height: 1; cursor: pointer; }
 .structure-name:focus { outline: none; }
 .remove-button { display: none; position: absolute; right: 0; top: 4px; width: 22px; height: 22px; border: 0; border-radius: 3px; background: #f6f3ef; color: #9b655c; font-size: 17px; cursor: pointer; }
 .structure-row:hover .remove-button { display: block; }
