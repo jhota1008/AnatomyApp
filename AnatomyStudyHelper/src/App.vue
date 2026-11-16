@@ -40,6 +40,8 @@ type Diagram = {
 
 type Folder = { id: string; name: string }
 
+type Rating = { upvotes: number; downvotes: number; myVote: -1 | 1 | null }
+
 type QuizQuestion = {
   diagramId: string
   diagramTitle: string
@@ -70,6 +72,9 @@ const MAX_BATCH_IMAGE_COUNT = 20
 const USER_STORAGE_LIMIT_BYTES = 250 * 1024 * 1024
 const diagrams = ref<Diagram[]>([])
 const folders = ref<Folder[]>([])
+const ratings = ref<Record<string, Rating>>({})
+const voteBusy = ref(false)
+const publicSort = ref<'recent' | 'highest' | 'lowest'>('recent')
 const legacyDiagrams = ref<LocalDiagram[]>([])
 const selectedId = ref('')
 const libraryView = ref<'mine' | 'public'>('mine')
@@ -153,10 +158,23 @@ const canEditActive = computed(() => Boolean(activeDiagram.value && user.value &
 const libraryDiagrams = computed(() => diagrams.value.filter((diagram) =>
     libraryView.value === 'mine' ? diagram.ownerId === user.value?.id : diagram.visibility === 'public',
   ))
-const visibleDiagrams = computed(() => libraryDiagrams.value.filter((diagram) =>
-  (!folderFilter.value || diagram.folderId === folderFilter.value)
-  && (!tagFilter.value || diagram.tags.includes(tagFilter.value)),
-))
+const visibleDiagrams = computed(() => {
+  const filtered = libraryDiagrams.value.filter((diagram) =>
+    (!folderFilter.value || diagram.folderId === folderFilter.value)
+    && (!tagFilter.value || diagram.tags.includes(tagFilter.value)),
+  )
+  if (libraryView.value === 'public' && publicSort.value !== 'recent') {
+    const direction = publicSort.value === 'highest' ? -1 : 1
+    filtered.sort((first, second) => {
+      const firstRating = ratings.value[first.id]
+      const secondRating = ratings.value[second.id]
+      const firstScore = (firstRating?.upvotes ?? 0) - (firstRating?.downvotes ?? 0)
+      const secondScore = (secondRating?.upvotes ?? 0) - (secondRating?.downvotes ?? 0)
+      return direction * (firstScore - secondScore) || second.updatedAt - first.updatedAt
+    })
+  }
+  return filtered
+})
 const availableFolders = computed(() => [...folders.value].sort((first, second) => first.name.localeCompare(second.name)))
 const availableTags = computed(() => [...new Set(libraryDiagrams.value.flatMap((diagram) => diagram.tags))].sort())
 const correctCount = computed(() => {
@@ -200,6 +218,7 @@ onMounted(async () => {
       else {
         diagrams.value = []
         folders.value = []
+        ratings.value = {}
         selectedId.value = ''
         legacyDiagrams.value = []
         cloudReady.value = false
@@ -323,6 +342,7 @@ async function loadCloudDiagrams() {
       })
     }
     diagrams.value = loaded
+    await loadRatings()
     const requestedDiagramId = new URLSearchParams(window.location.search).get('diagram')
     const requestedDiagram = loaded.find((diagram) => diagram.id === requestedDiagramId)
     selectedId.value = requestedDiagram?.id ?? loaded[0]?.id ?? ''
@@ -332,6 +352,40 @@ async function loadCloudDiagrams() {
     appError.value = getErrorMessage(error)
   } finally {
     cloudReady.value = true
+  }
+}
+
+async function loadRatings() {
+  if (!supabase || !user.value) return
+  const { data, error } = await supabase.rpc('get_public_diagram_ratings')
+  if (error) throw error
+  const nextRatings: Record<string, Rating> = {}
+  for (const row of data ?? []) {
+    nextRatings[row.diagram_id] = {
+      upvotes: Number(row.upvotes),
+      downvotes: Number(row.downvotes),
+      myVote: row.my_vote === 1 || row.my_vote === -1 ? row.my_vote : null,
+    }
+  }
+  ratings.value = nextRatings
+}
+
+async function voteOnDiagram(value: -1 | 1) {
+  const diagram = activeDiagram.value
+  if (!supabase || !user.value || !diagram || diagram.visibility !== 'public' || diagram.ownerId === user.value.id || voteBusy.value) return
+  voteBusy.value = true
+  try {
+    const currentVote = ratings.value[diagram.id]?.myVote
+    const request = currentVote === value
+      ? supabase.from('diagram_votes').delete().eq('diagram_id', diagram.id).eq('user_id', user.value.id)
+      : supabase.from('diagram_votes').upsert({ diagram_id: diagram.id, user_id: user.value.id, value }, { onConflict: 'diagram_id,user_id' })
+    const { error } = await request
+    if (error) throw error
+    await loadRatings()
+  } catch (error) {
+    appError.value = `Could not update vote: ${getErrorMessage(error)}`
+  } finally {
+    voteBusy.value = false
   }
 }
 
@@ -736,6 +790,13 @@ async function persistDiagram(diagram: Diagram) {
       if (structuresError) throw structuresError
     }
     saveState.value = 'saved'
+    if (diagram.visibility === 'public' && !ratings.value[diagram.id]) {
+      try {
+        await loadRatings()
+      } catch (error) {
+        appError.value = `Could not load ratings: ${getErrorMessage(error)}`
+      }
+    }
   } catch (error) {
     saveState.value = 'error'
     appError.value = `Could not save changes: ${getErrorMessage(error)}`
@@ -1282,6 +1343,14 @@ function onDrop(event: DragEvent) {
       </div>
       <button v-if="libraryView === 'mine'" class="new-folder-button" type="button" @click="openNewFolder"><span>＋</span> New Folder</button>
       <button v-if="libraryView === 'mine' && availableFolders.length" class="quiz-folder-button" type="button" @click="openQuizPicker"><span>✦</span> Quiz a folder</button>
+      <label v-if="libraryView === 'public'" class="folder-filter-label">
+        <span>SORT</span>
+        <select v-model="publicSort" aria-label="Sort public diagrams">
+          <option value="recent">Most recent</option>
+          <option value="highest">Highest rated</option>
+          <option value="lowest">Lowest rated</option>
+        </select>
+      </label>
       <label v-if="libraryView === 'mine' && availableFolders.length" class="folder-filter-label">
         <span>FOLDER</span>
         <select v-model="folderFilter" aria-label="Filter by folder">
@@ -1308,7 +1377,7 @@ function onDrop(event: DragEvent) {
           <span class="thumbnail"><img :src="diagram.image" :alt="''" /></span>
           <span class="diagram-link-copy">
             <span class="diagram-link-title">{{ diagram.title }}</span>
-            <span class="diagram-link-meta">{{ diagram.structures.length }} labels · {{ libraryView === 'mine' ? diagram.folderName || 'Unfiled' : 'Shared publicly' }}</span>
+            <span class="diagram-link-meta">{{ diagram.structures.length }} labels · {{ libraryView === 'mine' ? diagram.folderName || 'Unfiled' : `↑ ${ratings[diagram.id]?.upvotes ?? 0} / ↓ ${ratings[diagram.id]?.downvotes ?? 0}` }}</span>
           </span>
           <span class="active-dot"></span>
         </button>
@@ -1335,6 +1404,7 @@ function onDrop(event: DragEvent) {
         <button type="button" role="tab" :aria-selected="libraryView === 'public'" :class="{ active: libraryView === 'public' }" @click="libraryView = 'public'; folderFilter = ''; tagFilter = ''">Public library</button>
         <button v-if="libraryView === 'mine'" class="new-folder-button mobile-new-folder" type="button" @click="openNewFolder"><span>＋</span> New Folder</button>
         <button v-if="libraryView === 'mine' && availableFolders.length" class="quiz-folder-button mobile-quiz-folder" type="button" @click="openQuizPicker"><span>✦</span> Quiz a folder</button>
+        <label v-if="libraryView === 'public'" class="mobile-filter"><span>Sort</span><select v-model="publicSort" aria-label="Sort public diagrams"><option value="recent">Most recent</option><option value="highest">Highest rated</option><option value="lowest">Lowest rated</option></select></label>
         <label v-if="libraryView === 'mine' && availableFolders.length" class="mobile-filter"><span>Folder</span><select v-model="folderFilter"><option value="">All folders</option><option v-for="folder in availableFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
         <label v-if="availableTags.length" class="mobile-filter"><span>Topic</span><select v-model="tagFilter"><option value="">All topics</option><option v-for="tag in availableTags" :key="tag" :value="tag">{{ tag }}</option></select></label>
       </div>
@@ -1467,6 +1537,10 @@ function onDrop(event: DragEvent) {
             </div>
           </template>
           <div v-else class="public-readonly"><span class="public-icon">↗</span><span><strong>Public diagram</strong><small>Shared by another learner · Read only</small></span><div class="public-tag-list"><span v-for="tag in activeDiagram.tags" :key="tag" class="topic-tag">{{ tag }}</span></div></div>
+          <div v-if="activeDiagram.visibility === 'public'" class="rating-controls" role="group" aria-label="Diagram rating">
+            <button type="button" :disabled="canEditActive || voteBusy" :aria-pressed="ratings[activeDiagram.id]?.myVote === 1" :title="canEditActive ? 'You cannot vote on your own diagram' : 'Upvote diagram'" aria-label="Upvote diagram" @click="voteOnDiagram(1)"><span aria-hidden="true">↑</span><span>{{ ratings[activeDiagram.id]?.upvotes ?? 0 }}</span></button>
+            <button type="button" :disabled="canEditActive || voteBusy" :aria-pressed="ratings[activeDiagram.id]?.myVote === -1" :title="canEditActive ? 'You cannot vote on your own diagram' : 'Downvote diagram'" aria-label="Downvote diagram" @click="voteOnDiagram(-1)"><span aria-hidden="true">↓</span><span>{{ ratings[activeDiagram.id]?.downvotes ?? 0 }}</span></button>
+          </div>
           <div v-if="activeDiagram.visibility === 'public'" class="share-action">
             <button class="text-button share-button" type="button" @click="copyShareLink">
               <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M8 12 12 8m-5.5 6H5a3 3 0 0 1 0-6h2m6 4h2a3 3 0 0 0 0-6h-1.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
@@ -1917,6 +1991,10 @@ button:focus-visible, input:focus-visible { outline: 2px solid #6a9a77; outline-
 .public-readonly strong { color: #597259; font-size: 10px; font-weight: 600; }
 .public-readonly small { margin-top: 2px; color: #92998f; font-size: 9px; }
 .public-tag-list { display: flex; flex-wrap: wrap; gap: 4px; margin-left: 8px; }
+.rating-controls { display: flex; align-items: center; gap: 5px; }
+.rating-controls button { display: inline-flex; min-width: 46px; height: 30px; align-items: center; justify-content: center; gap: 6px; border: 1px solid #dfe4db; border-radius: 3px; background: #fff; color: #647061; font-size: 11px; cursor: pointer; }
+.rating-controls button[aria-pressed='true'] { border-color: #78937a; background: #eaf2e8; color: #345b3e; }
+.rating-controls button:disabled { cursor: default; opacity: .7; }
 .eyebrow { display: flex; align-items: center; gap: 8px; color: #879084; font-family: var(--mono); font-size: 9px; letter-spacing: .13em; }
 .eyebrow-line { width: 17px; height: 1px; background: #779179; }
 .title-input, .page-title { display: block; max-width: 720px; margin: 9px 0 3px; padding: 0; border: 0; outline: none; background: transparent; color: #29332d; font-family: var(--serif); font-size: 38px; font-weight: 400; line-height: 1.05; }

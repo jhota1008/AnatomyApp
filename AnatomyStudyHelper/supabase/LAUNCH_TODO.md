@@ -2,6 +2,11 @@
 
 ## Test in Supabase
 
+- Apply `migrations/20261115_diagram_votes.sql` before deploying the voting UI.
+- With two accounts, test vote creation, switching, removal, and counts on a public diagram; verify owners cannot vote on their own diagrams.
+- Verify anonymous users, other users' votes, private diagram votes, and forged `user_id` writes are inaccessible through the API. Verify deletion removes associated votes.
+- Check that making a diagram private hides its ratings and that making it public again restores its existing votes.
+- Review lowest-rated public diagrams manually, considering both vote counts and possible abuse. There is no automatic deletion or moderator account feature.
 - Apply `migrations/20261105_launch_hardening.sql` with the Supabase SQL editor or migration tooling.
 - Confirm the `anatomy-diagrams` bucket still permits `image/webp` uploads up to 25 MB.
 - Confirm existing PNG/JPEG image replacements fail until those files are converted; new uploads are converted by the browser.
